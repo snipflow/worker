@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-09",
+  "vars": {
+    "SNIPFLOW_API_TOKEN": "<YOUR_API_TOKEN>",
+    "SNIPFLOW_STORAGE_LIMIT": "104857600",
+    "SNIPFLOW_DISGUISE": "false"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SNIPFLOW_KV",
+      "id": "<YOUR_KV_NAMESPACE_ID>"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "SNIPFLOW_R2",
+      "bucket_name": "<YOUR_R2_BUCKET_NAME>"
+    }
+  ]
+  // "triggers": {
+  //   "crons": ["0 * * * *"]
+  // }
+}
