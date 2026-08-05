@@ -93,6 +93,7 @@ app.use('/snip', contentTypeGuard)  // 6. 仅 POST 请求校验
 | 401 | `UNAUTHORIZED` | Token 缺失或无效 |
 | 404 | `NOT_FOUND` | 资源不存在 |
 | 405 | `METHOD_NOT_ALLOWED` | 不支持的 HTTP 方法 |
+| 409 | `KEY_CONFLICT` | key 已存在，需确认后使用 overwrite 参数 |
 | 413 | `PAYLOAD_TOO_LARGE` | 请求体超限 |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | Content-Type 不支持 |
 | 500 | `INTERNAL_ERROR` | 服务内部错误 |
@@ -154,7 +155,8 @@ GET    /stats               查询存储统计信息
   "expiry": {
     "mode": "ttl",
     "ttl": 86400
-  }
+  },
+  "overwrite": false
 }
 ```
 
@@ -162,11 +164,12 @@ GET    /stats               查询存储统计信息
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `key` | `string` | 用户自定义查询键，接收方凭此键精确取回内容。传空字符串 `""` 时由服务端生成随机 ID |
+| `key` | `string` | 用户自定义查询键，接收方凭此键精确取回内容。传空字符串 `""` 时由服务端生成随机 key |
 | `type` | `string` | 内容类型，见下表，Zod `z.enum` 严格枚举校验 |
 | `content` | `string` | 实际内容，不得为空字符串 |
 | `source` | `string` | 来源标记（`page` / `bot-tg` 等），仅作元数据记录 |
 | `expiry` | `object` | 时效策略，见下表 |
+| `overwrite` | `boolean`（可选） | 默认 `false`。为 `true` 时强制覆盖已存在的 key，为 `false` 时 key 冲突返回 `409 KEY_CONFLICT` |
 
 **时效策略（`expiry` 字段）：**
 
@@ -439,7 +442,7 @@ src/
     errors.ts               AppError 基类及各子类（NotFoundError、UnauthorizedError 等）
 
   utils/
-    id.ts                   snip key 随机生成（nanoid）
+    key.ts                  snip key 随机生成（nanoid）
     time.ts                 时间工具（ISO 格式化、TTL 转时间戳）
 
   jobs/
@@ -581,7 +584,7 @@ POST /snip（正确头）    body > 100MB → 413
 
 实现步骤：
 12. 编写 `src/domain/types.ts`：`SnipMeta`、`CreateSnipInput`、`SnipExpiry`
-13. 编写 `src/utils/id.ts`：`generateId()` 基于 nanoid
+13. 编写 `src/utils/key.ts`：`generateKey()` 基于 nanoid，生成随机 snip 标识符
 14. 编写 `src/utils/time.ts`：`ttlToExpiresAt(ttl)`、ISO 格式化
 15. 编写 `src/repositories/kv.ts`：`getSnip`、`putSnip`、`deleteSnip`、`listSnips`、`getCounter`、`setCounter`
 16. 编写 `src/repositories/r2.ts`：`putPayload`、`getPayload`、`deletePayload`、`listPayloads`
@@ -623,7 +626,7 @@ expiry.mode = "forever" → success: true
 **目标：** 将业务规则编码为纯函数，不依赖 Hono context，覆盖所有业务分支。
 
 实现步骤：
-19. 编写 `src/services/snip/create.ts`：key 为空时生成随机 ID，先写 R2 再写 KV，按 expiry 设 TTL，更新计数器，R2 写入失败时回滚
+19. 编写 `src/services/snip/create.ts`：key 为空时生成随机 key 并检查冲突（最多重试 3 次），用户提供的 key 需检查是否已存在（`overwrite=false` 时冲突返回 `KeyConflictError`），先写 R2 再写 KV，按 expiry 设 TTL，更新计数器，R2 写入失败时回滚
 20. 编写 `src/services/snip/read.ts`：读 KV metadata + 读 R2 payload，任一不存在返回 NotFoundError
 21. 编写 `src/services/snip/list.ts`：KV list 分页，返回元数据列表
 22. 编写 `src/services/snip/delete.ts`：先删 KV 再删 R2，更新计数器
@@ -633,6 +636,8 @@ expiry.mode = "forever" → success: true
 ```
 create key="" → 返回 meta.key 为非空随机字符串
 create key="abc" → 返回 meta.key = "abc"
+create key="abc"（已存在，overwrite=false）→ 抛出 KeyConflictError
+create key="abc"（已存在，overwrite=true）→ 成功覆盖
 create mode="ttl" → KV 条目携带 expiresAt
 create → stats count+1，totalSize += size
 delete → stats count-1，totalSize -= size
@@ -655,6 +660,8 @@ delete 不存在的 key → 抛出 NotFoundError
 ```
 POST /snip（合法）→ 201，body 包含 key、type、size、createdAt
 POST /snip 缺字段 → 400 INVALID_INPUT，body 含 issues 列表
+POST /snip（key 已存在，overwrite=false）→ 409 KEY_CONFLICT
+POST /snip（key 已存在，overwrite=true）→ 201，成功覆盖
 GET  /snip/:key（存在）→ 200，body 包含 content
 GET  /snip/:key（不存在）→ 404 NOT_FOUND
 DELETE /snip/:key → 204

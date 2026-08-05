@@ -53,6 +53,12 @@ export class InternalError extends AppError {
   }
 }
 
+export class KeyConflictError extends AppError {
+  constructor(message = 'Key already exists') {
+    super(message, 'KEY_CONFLICT', 409)
+  }
+}
+
 export function handleError(err: Error, c: Context) {
   const requestId = c.get('requestId')
   const disguise = c.env.SNIPFLOW_DISGUISE === 'true'
