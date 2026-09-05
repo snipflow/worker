@@ -1,4 +1,33 @@
+import { z } from 'zod'
+import { InternalError } from '../domain/errors'
 import type { SnipMeta } from '../domain/types'
+
+const SnipMetaSchema = z.strictObject({
+  key: z.string().min(1),
+  type: z.enum(['text', 'image', 'file']),
+  source: z.string().min(1),
+  size: z.number().int().nonnegative(),
+  createdAt: z.iso.datetime({ offset: true }),
+  expiresAt: z.iso.datetime({ offset: true }).nullable(),
+  r2Key: z.string().min(1),
+}) satisfies z.ZodType<SnipMeta>
+
+function parseSnipMeta(raw: string): SnipMeta {
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new InternalError('Invalid snip metadata in KV')
+  }
+
+  const result = SnipMetaSchema.safeParse(parsed)
+  if (!result.success) {
+    throw new InternalError('Invalid snip metadata in KV')
+  }
+
+  return result.data
+}
 
 /**
  * KV 仓储层：封装对 Cloudflare KV 的所有操作
@@ -10,7 +39,7 @@ import type { SnipMeta } from '../domain/types'
 export async function getSnip(kv: KVNamespace, key: string): Promise<SnipMeta | null> {
   const raw = await kv.get(`snip:${key}`)
   if (!raw) return null
-  return JSON.parse(raw) as SnipMeta
+  return parseSnipMeta(raw)
 }
 
 /**

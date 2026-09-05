@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:workers'
 import { describe, it, expect, beforeEach } from 'vitest'
 import * as kvRepo from '../../src/repositories/kv'
+import { InternalError } from '../../src/domain/errors'
 import type { SnipMeta } from '../../src/domain/types'
 
 describe('KV Repository', () => {
@@ -36,6 +37,16 @@ describe('KV Repository', () => {
     it('should return null for non-existent key', async () => {
       const result = await kvRepo.getSnip(kv, 'non-existent')
       expect(result).toBeNull()
+    })
+
+    it('should reject invalid JSON metadata', async () => {
+      await kv.put('snip:invalid-json', '{')
+      await expect(kvRepo.getSnip(kv, 'invalid-json')).rejects.toBeInstanceOf(InternalError)
+    })
+
+    it('should reject metadata with an invalid shape', async () => {
+      await kv.put('snip:invalid-shape', JSON.stringify({ key: 'invalid-shape' }))
+      await expect(kvRepo.getSnip(kv, 'invalid-shape')).rejects.toBeInstanceOf(InternalError)
     })
 
     it('should support TTL expiration', async () => {

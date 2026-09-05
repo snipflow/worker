@@ -126,6 +126,14 @@ GET    /stats               查询存储统计信息
 
 `GET /health` 无需认证，用于基础存活探测。`GET /health/auth` 要求携带 Bearer Token，前端可在初始化时调用此接口验证 Token 是否配置正确，响应 200 表示认证通过，401 表示 Token 无效。
 
+**API 边界 Schema 约定：**
+
+- 所有来自客户端的动态输入都必须在路由层通过 Zod 校验，包括 JSON 请求体、路径参数和查询参数。
+- KV 中的 JSON 元数据属于持久化边界，读取并反序列化后必须通过 `SnipMetaSchema` 校验，禁止直接使用类型断言信任历史数据。
+- Worker 自己构造的响应不重复执行 Zod 运行时校验，改用 TypeScript DTO 类型和显式字段映射保证结构正确。
+- 路由不得直接将 `SnipMeta` 传给 `c.json()`，必须逐字段构造公开 DTO，避免泄漏 `r2Key` 等内部字段；对象字面量使用 `satisfies` 校验 DTO 类型。
+- 前端若需要防御网络响应与客户端版本不一致，应在前端边界校验响应，或后续通过共享契约生成客户端类型。
+
 **`GET /stats` 响应示例：**
 
 ```json
@@ -164,7 +172,7 @@ GET    /stats               查询存储统计信息
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `key` | `string` | 用户自定义查询键，接收方凭此键精确取回内容。传空字符串 `""` 时由服务端生成随机 key |
+| `key` | `string` | 用户自定义查询键，接收方凭此键精确取回内容。允许空字符串 `""`（由服务端生成随机 key）；非空时必须为 1–128 个 URL-safe 字符，仅允许字母、数字、`_`、`-` |
 | `type` | `string` | 内容类型，见下表，Zod `z.enum` 严格枚举校验 |
 | `content` | `string` | 实际内容，不得为空字符串 |
 | `source` | `string` | 来源标记（`page` / `bot-tg` 等），仅作元数据记录 |
@@ -228,7 +236,7 @@ Zod 使用 `z.enum(["text", "image", "file"])` 做枚举校验，非法值返回
 |---------|------|
 | `z.object({...})` | 定义请求体结构，所有字段默认必填 |
 | `z.string().min(1, "不得为空")` | 校验 `content`、`source` 等字符串字段非空 |
-| `z.string()` | 校验 `key`，允许空字符串（服务端据此决定是否生成随机 ID） |
+| `z.union([z.literal(""), SnipKeySchema])` | 创建时允许空 key；非空 key 复用统一的 URL-safe key 规则 |
 | `z.enum([...])` | 校验 `type` 为枚举值，非法值自动报错 |
 | `z.discriminatedUnion("mode", [...])` | 按 `expiry.mode` 分支校验：`ttl` 模式必须包含正整数 `ttl`，`forever` 模式不得有多余字段 |
 | `z.number().int().positive()` | 校验 `ttl` 为正整数秒数 |
@@ -242,8 +250,14 @@ const ExpirySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("ttl"), ttl: z.number().int().positive() }),
 ])
 
+const SnipKeySchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/)
+
 const CreateSnipSchema = z.object({
-  key: z.string(),
+  key: z.union([z.literal(""), SnipKeySchema]),
   type: z.enum(["text", "image", "file"]),
   content: z.string().min(1, { error: "content 不得为空" }),
   source: z.string().min(1, { error: "source 不得为空" }),
@@ -294,6 +308,8 @@ if (!result.success) {
 
 返回元数据列表，不包含 `content` 字段，支持分页：
 
+查询参数：`cursor` 可选，值为上一次响应返回的非空不透明字符串；每页固定最多返回 100 条，不对外开放 `limit` 参数。
+
 ```json
 {
   "items": [
@@ -308,6 +324,33 @@ if (!result.success) {
   "cursor": "next-page-cursor"
 }
 ```
+
+### 5.4 输入 Schema 与响应 DTO 映射
+
+| 接口 | 运行时输入 Schema | TypeScript 响应 DTO |
+|------|-------------------|---------------------|
+| `POST /snip` | `CreateSnipSchema` | `CreateSnipResponse` |
+| `GET /snip` | `ListSnipsQuerySchema` | `ListSnipsResponse` |
+| `GET /snip/:key` | `SnipKeyParamsSchema` | `ReadSnipResponse` |
+| `DELETE /snip/:key` | `SnipKeyParamsSchema` | 无（204） |
+| `GET /stats` | 无动态输入 | `Stats` |
+
+运行时 Schema 组成约定：
+
+- `SnipKeySchema`：1–128 个 URL-safe 字符，仅允许 `[A-Za-z0-9_-]`。该限制同时避免 R2 对象路径与 cleanup 提取逻辑产生歧义。
+- `SnipKeyParamsSchema`：`{ key: SnipKeySchema }`，用于读取和删除路由。
+- `ListSnipsQuerySchema`：`{ cursor?: string }`，cursor 存在时不得为空；未知查询字段拒绝处理。
+- `SnipMetaSchema`：KV 内部元数据结构，包含 `r2Key`，只用于存储边界，不直接作为 HTTP 响应。
+
+响应 DTO 组成约定：
+
+- `CreateSnipResponse`：创建成功后的公开元数据，不包含 `r2Key`。
+- `ReadSnipResponse`：公开元数据加 `content`，不包含 `r2Key`。
+- `ListSnipItem`：列表项字段（`key`、`type`、`size`、`createdAt`、`expiresAt`），不包含 `content`、`source`、`r2Key`。
+- `ListSnipsResponse`：`{ items: ListSnipItem[], cursor?: string }`。
+- `Stats`：`{ count, totalSize, storageLimit }`，三个字段均为非负整数。
+
+以上 DTO 定义在 `domain/types.ts`。路由通过显式 mapper 或逐字段对象字面量构造 DTO，不允许使用 `{ ...meta }` 展开内部 metadata。
 
 ## 7. 存储模型
 
@@ -329,7 +372,16 @@ await env.SNIPFLOW_KV.put(
 **KV 读取：**
 ```ts
 const raw = await env.SNIPFLOW_KV.get(`snip:${key}`)
+if (!raw) return null
+
+const result = SnipMetaSchema.safeParse(JSON.parse(raw))
+if (!result.success) {
+  throw new InternalError('Invalid snip metadata in KV')
+}
+return result.data
 ```
+
+KV 的值可能来自旧版本、人工写入或损坏数据，因此 `JSON.parse(raw) as SnipMeta` 不构成有效校验。JSON 解析失败或 `SnipMetaSchema` 校验失败都按内部存储错误处理，不向客户端暴露具体数据内容。
 
 **KV 列表（分页）：**
 ```ts
@@ -422,8 +474,7 @@ src/
     content-type.ts         POST 写请求的 Content-Type 校验
 
   schemas/
-    snip.ts                 CreateSnipSchema、SnipMetaSchema（Zod）
-    stats.ts                StatsSchema
+    snip.ts                 key/params/query、创建请求体 Schema（Zod）
 
   services/
     snip/
@@ -434,11 +485,11 @@ src/
     stats.ts                存储统计业务逻辑
 
   repositories/
-    kv.ts                   KV 读写封装（put / get / list / delete / counter）
+    kv.ts                   KV 读写封装及 KV metadata 反序列化校验（put / get / list / delete / counter）
     r2.ts                   R2 读写封装（put / get / delete / list）
 
   domain/
-    types.ts                SnipMeta、CreateSnipInput 等核心类型
+    types.ts                SnipMeta、CreateSnipInput、公开响应 DTO 等核心类型
     errors.ts               AppError 基类及各子类（NotFoundError、UnauthorizedError 等）
 
   utils/
@@ -455,12 +506,12 @@ src/
 
 | 层级 | 职责 |
 |------|------|
-| routes | 解析路径参数和请求体，调用服务层，返回 HTTP 响应 |
+| routes | 解析并校验动态输入，调用服务层，通过显式字段映射构造类型化 HTTP 响应 |
 | middleware | 处理跨请求的横切行为（Request ID、守卫、认证、Content-Type） |
-| schemas | 用 Zod 定义并校验请求输入和响应输出的边界类型 |
+| schemas | 用 Zod 定义并校验客户端的动态请求输入 |
 | services | 承载业务逻辑，协调 KV 与 R2 的读写顺序，处理计数器更新 |
-| repositories | 封装对 KV 和 R2 的原始 API 调用，返回类型化结果 |
-| domain | 定义跨层共享的稳定类型和错误基类 |
+| repositories | 封装对 KV 和 R2 的原始 API 调用，在存储边界校验反序列化数据，返回类型化结果 |
+| domain | 定义跨层共享的稳定领域类型、响应 DTO 和错误基类 |
 | utils | 仅包含无副作用的小型工具函数 |
 | jobs | Cron Trigger 定时任务（R2 孤立对象清理） |
 
@@ -494,6 +545,7 @@ _repositories/kv_
 - `putSnip` 带 `expirationTtl` 写入后 key 存在于 KV
 - `deleteSnip` 后 `getSnip` 返回 null
 - `listSnips` 返回 `snip:` 前缀的所有 key
+- KV 中存在非法 JSON 或不符合 `SnipMetaSchema` 的 metadata 时，`getSnip` 抛出内部错误而不是返回伪造类型
 
 _repositories/r2_
 - `putPayload` 写入后 `getPayload` 返回相同内容
@@ -504,8 +556,12 @@ _schemas/snip_
 - `CreateSnipSchema.safeParse` 对合法输入返回 `success: true`
 - `type` 传入 `"link"` 返回失败，错误指向 `type` 字段
 - `content` 为空字符串返回失败
+- `content` 的 UTF-8 字节数超过 `SNIPFLOW_MAX_SNIP_SIZE` 返回失败，错误指向 `content` 字段
 - `expiry.mode = "ttl"` 且缺少 `ttl` 字段返回失败
 - `expiry.mode = "forever"` 且附带 `ttl` 字段应被忽略或返回失败
+- 创建请求的 `key = ""` 合法；非空 key 包含 `/`、空格或超过 128 字符时返回失败
+- `SnipKeyParamsSchema` 拒绝空 key 和非 URL-safe key
+- `ListSnipsQuerySchema` 接受缺省或非空 cursor，拒绝空 cursor 和未知字段
 
 _services/snip/create_
 - `key` 为 `""` 时响应中 key 为随机生成的非空字符串
@@ -523,6 +579,8 @@ _routes（集成）_
 - `GET /health/auth` 携带正确 Token 返回 200
 - `POST /snip` 缺少 `content` 字段返回 400，body 包含 `INVALID_INPUT`
 - `POST /snip` → `GET /snip/:key` → `DELETE /snip/:key` 完整生命周期
+- 创建与读取响应不包含内部字段 `r2Key`
+- 列表响应不包含 `content`、`source`、`r2Key`
 - 伪装模式开启时，401 场景改为返回 200 `<h1>Hello World</h1>`
 
 _jobs/cleanup_
@@ -583,16 +641,17 @@ POST /snip（正确头）    body > 100MB → 413
 **目标：** 建立类型基础，封装底层存储访问，不包含任何业务逻辑。
 
 实现步骤：
-12. 编写 `src/domain/types.ts`：`SnipMeta`、`CreateSnipInput`、`SnipExpiry`
+12. 编写 `src/domain/types.ts`：`SnipMeta`、`CreateSnipInput`、`SnipExpiry`，以及 `CreateSnipResponse`、`ReadSnipResponse`、`ListSnipItem`、`ListSnipsResponse`、`Stats` 响应 DTO
 13. 编写 `src/utils/key.ts`：`generateKey()` 基于 nanoid，生成随机 snip 标识符
 14. 编写 `src/utils/time.ts`：`ttlToExpiresAt(ttl)`、ISO 格式化
-15. 编写 `src/repositories/kv.ts`：`getSnip`、`putSnip`、`deleteSnip`、`listSnips`、`getCounter`、`setCounter`
+15. 编写 `src/repositories/kv.ts`：`getSnip`、`putSnip`、`deleteSnip`、`listSnips`、`getCounter`、`setCounter`；在仓储内部使用 `SnipMetaSchema` 校验 KV 反序列化结果，禁止 `JSON.parse(...) as SnipMeta`
 16. 编写 `src/repositories/r2.ts`：`putPayload`、`getPayload`、`deletePayload`、`listPayloads`
 
 验收测试（单元）：
 ```
 kv.putSnip → kv.getSnip 返回相同内容
 kv.deleteSnip → kv.getSnip 返回 null
+KV metadata 为非法 JSON 或结构不合法 → kv.getSnip 抛出 InternalError
 r2.putPayload → r2.getPayload 返回相同内容
 r2.deletePayload → r2.getPayload 返回 null
 kv.listSnips 只返回 snip: 前缀的 key
@@ -603,11 +662,11 @@ r2.listPayloads 只返回 snips/ 前缀的对象
 
 ### 阶段四：Schema 校验层
 
-**目标：** 请求体在进入业务逻辑前完成结构校验，非法输入有明确错误字段指向。
+**目标：** 所有动态 HTTP 请求输入在进入业务逻辑前完成结构与取值约束校验，非法数据有准确字段指向。
 
 实现步骤：
-17. 编写 `src/schemas/snip.ts`：`ExpirySchema`（discriminatedUnion）、`CreateSnipSchema`（包含 `content` 字段大小校验，上限由环境变量 `SNIPFLOW_MAX_SNIP_SIZE` 决定）、`SnipMetaSchema`
-18. 编写 `src/schemas/stats.ts`：`StatsSchema`
+17. 编写 `src/schemas/snip.ts`：`SnipKeySchema`、`SnipKeyParamsSchema`、`ListSnipsQuerySchema`、`ExpirySchema`（discriminatedUnion）
+18. 编写 `CreateSnipSchema`：包含 UTF-8 content 字节大小校验，上限由环境变量 `SNIPFLOW_MAX_SNIP_SIZE` 决定
 
 验收测试（单元）：
 ```
@@ -617,6 +676,11 @@ content = "" → success: false，issues 指向 content 字段
 content 超过 SNIPFLOW_MAX_SNIP_SIZE → success: false，issues 指向 content 字段
 expiry.mode = "ttl" 且无 ttl → success: false，issues 指向 expiry.ttl
 expiry.mode = "forever" → success: true
+key = ""（创建请求）→ success: true
+key 包含 "/"、空格或超过 128 字符 → success: false，issues 指向 key 字段
+GET/DELETE path key 合法 → SnipKeyParamsSchema success: true
+cursor 缺省或为非空字符串 → ListSnipsQuerySchema success: true
+cursor = "" 或包含未知查询字段 → success: false
 ```
 
 ---
@@ -652,8 +716,8 @@ delete 不存在的 key → 抛出 NotFoundError
 **目标：** 将服务层能力暴露为 HTTP 接口，端到端完整可用。
 
 实现步骤：
-24. 编写 `src/routes/snip.ts`：接入 `CreateSnipSchema.safeParse`，调用 `services/snip/*`
-25. 编写 `src/routes/stats.ts`：调用 `services/stats`
+24. 编写 `src/routes/snip.ts`：使用 `CreateSnipSchema`、`SnipKeyParamsSchema`、`ListSnipsQuerySchema` 校验所有动态输入；调用 `services/snip/*`；通过显式字段映射构造对应响应 DTO，禁止直接展开 `SnipMeta`
+25. 编写 `src/routes/stats.ts`：调用 `services/stats`，返回类型为 `Stats` DTO
 26. 在 `app.ts` 中注册全部路由
 
 验收测试（集成）：

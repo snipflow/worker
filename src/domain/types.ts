@@ -29,3 +29,34 @@ export interface SnipMeta {
   expiresAt: string | null
   r2Key: string
 }
+
+/**
+ * 创建成功响应 DTO（不包含内部 R2 路径）
+ */
+export type CreateSnipResponse = Omit<SnipMeta, 'r2Key'>
+
+/**
+ * 读取成功响应 DTO
+ */
+export type ReadSnipResponse = CreateSnipResponse & {
+  content: string
+}
+
+/**
+ * 列表项 DTO
+ */
+export type ListSnipItem = Pick<
+  SnipMeta,
+  'key' | 'type' | 'size' | 'createdAt' | 'expiresAt'
+>
+
+export interface ListSnipsResponse {
+  items: ListSnipItem[]
+  cursor?: string
+}
+
+export interface Stats {
+  count: number
+  totalSize: number
+  storageLimit: number
+}
