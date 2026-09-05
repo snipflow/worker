@@ -24,7 +24,10 @@ export class NotFoundError extends AppError {
 }
 
 export class InvalidInputError extends AppError {
-  constructor(message: string) {
+  constructor(
+    public readonly issues: readonly unknown[],
+    message = 'Invalid input'
+  ) {
     super(message, 'INVALID_INPUT', 400)
   }
 }
@@ -69,7 +72,13 @@ export function handleError(err: Error, c: Context) {
       return c.html('<html><body><h1>Hello World</h1></body></html>', 200)
     }
     const { code, message, status } = err
-    return c.json({ error: { code, message, requestId } }, status as 400 | 401 | 404 | 405 | 413 | 415 | 500)
+    const error = err instanceof InvalidInputError
+      ? { code, message, requestId, issues: err.issues }
+      : { code, message, requestId }
+    return c.json(
+      { error },
+      status as 400 | 401 | 404 | 405 | 409 | 413 | 415 | 500
+    )
   }
 
   console.error(`[error] requestId=${requestId} unexpected error:`, err)

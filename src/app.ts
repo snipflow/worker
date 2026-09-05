@@ -4,6 +4,8 @@ import { methodGuard, bodyLimitGuard } from './middleware/guard'
 import { contentTypeGuard } from './middleware/content-type'
 import { createAuthMiddleware } from './middleware/auth'
 import { handleError } from './domain/errors'
+import snipRoutes from './routes/snip'
+import statsRoutes from './routes/stats'
 
 const app = new Hono<{ Bindings: CloudflareBindings }>()
 
@@ -22,6 +24,10 @@ app.get('/health/auth', (c, next) => createAuthMiddleware(c.env)(c, next), (c) =
 })
 
 app.use('/snip/*', (c, next) => createAuthMiddleware(c.env)(c, next))
+app.use('/stats', (c, next) => createAuthMiddleware(c.env)(c, next))
 app.use('/snip', contentTypeGuard)
+
+app.route('/snip', snipRoutes)
+app.route('/stats', statsRoutes)
 
 export default app
