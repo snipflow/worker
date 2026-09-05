@@ -5,7 +5,7 @@
   "compatibility_date": "2026-07-09",
   "vars": {
     "SNIPFLOW_API_TOKEN": "<YOUR_API_TOKEN>",
-    "SNIPFLOW_STORAGE_LIMIT": "104857600",
+    "SNIPFLOW_TOTAL_STORAGE_LIMIT": "104857600",
     "SNIPFLOW_DISGUISE": "false"
   },
   "kv_namespaces": [
