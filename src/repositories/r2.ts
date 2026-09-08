@@ -2,27 +2,31 @@
  * R2 仓储层：封装对 Cloudflare R2 的所有操作
  */
 
+import type { SnipPayload } from '../domain/types'
+
+export interface PutPayloadOptions {
+  httpMetadata?: R2HTTPMetadata
+  customMetadata?: Record<string, string>
+  storageClass?: string
+}
+
 /**
  * 写入 payload 到 R2
  */
 export async function putPayload(
   r2: R2Bucket,
   key: string,
-  content: string,
-  contentType: string
-): Promise<void> {
-  await r2.put(`snips/${key}/payload`, content, {
-    httpMetadata: { contentType },
-  })
+  payload: SnipPayload,
+  options: PutPayloadOptions = {}
+): Promise<R2Object> {
+  return await r2.put(`snips/${key}/payload`, payload, options)
 }
 
 /**
  * 读取 R2 payload
  */
-export async function getPayload(r2: R2Bucket, key: string): Promise<string | null> {
-  const obj = await r2.get(`snips/${key}/payload`)
-  if (!obj) return null
-  return await obj.text()
+export async function getPayload(r2: R2Bucket, key: string): Promise<R2ObjectBody | null> {
+  return await r2.get(`snips/${key}/payload`)
 }
 
 /**

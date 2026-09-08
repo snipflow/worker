@@ -1,4 +1,4 @@
-import { KeyConflictError } from '../../domain/errors'
+import { KeyConflictError, PayloadTooLargeError } from '../../domain/errors'
 import type { CreateSnipInput, SnipMeta } from '../../domain/types'
 import {
   getSnip,
@@ -11,7 +11,6 @@ import { generateKey } from '../../utils/key'
 import { nowISO, ttlToExpiresAt } from '../../utils/time'
 
 const MAX_GENERATED_KEY_ATTEMPTS = 3
-const utf8Encoder = new TextEncoder()
 
 type CreateSnipBindings = Pick<
   CloudflareBindings,
@@ -20,12 +19,6 @@ type CreateSnipBindings = Pick<
 
 export interface CreateSnipOptions {
   generateKey?: () => string
-}
-
-const contentTypes: Record<CreateSnipInput['type'], string> = {
-  text: 'text/plain',
-  image: 'image/png',
-  file: 'application/octet-stream',
 }
 
 async function resolveKey(
@@ -47,10 +40,14 @@ async function restorePayload(
   r2: R2Bucket,
   key: string,
   previousMeta: SnipMeta | null,
-  previousContent: string | null
+  previousPayload: R2ObjectBody | null
 ): Promise<void> {
-  if (previousMeta && previousContent !== null) {
-    await putPayload(r2, key, previousContent, contentTypes[previousMeta.type])
+  if (previousMeta && previousPayload) {
+    await putPayload(r2, key, previousPayload.body, {
+      httpMetadata: previousPayload.httpMetadata,
+      customMetadata: previousPayload.customMetadata,
+      storageClass: previousPayload.storageClass,
+    })
     return
   }
 
@@ -76,27 +73,37 @@ export async function createSnip(
     throw new KeyConflictError()
   }
 
-  const previousContent = previousMeta
+  const previousPayload = previousMeta
     ? await getPayload(bindings.SNIPFLOW_R2, key)
     : null
-  const size = utf8Encoder.encode(input.content).byteLength
-  const meta: SnipMeta = {
-    key,
-    type: input.type,
-    source: input.source,
-    size,
-    createdAt: nowISO(),
-    expiresAt: input.expiry.mode === 'ttl' ? ttlToExpiresAt(input.expiry.ttl) : null,
-    r2Key: `snips/${key}/payload`,
-  }
   const expirationTtl = input.expiry.mode === 'ttl' ? input.expiry.ttl : undefined
+  let meta: SnipMeta
 
   try {
-    await putPayload(bindings.SNIPFLOW_R2, key, input.content, contentTypes[input.type])
+    const stored = await putPayload(bindings.SNIPFLOW_R2, key, input.payload, {
+      httpMetadata: input.httpMetadata,
+      customMetadata: input.customMetadata,
+    })
+    if (stored.size > input.maxSize) {
+      throw new PayloadTooLargeError()
+    }
+    meta = {
+      key,
+      contentType:
+        stored.httpMetadata?.contentType
+        ?? input.httpMetadata.contentType
+        ?? 'application/octet-stream',
+      filename: stored.customMetadata?.filename ?? input.customMetadata.filename ?? null,
+      source: input.source,
+      size: stored.size,
+      createdAt: nowISO(),
+      expiresAt: input.expiry.mode === 'ttl' ? ttlToExpiresAt(input.expiry.ttl) : null,
+      r2Key: `snips/${key}/payload`,
+    }
     await putSnip(bindings.SNIPFLOW_KV, key, meta, expirationTtl)
   } catch (error) {
     try {
-      await restorePayload(bindings.SNIPFLOW_R2, key, previousMeta, previousContent)
+      await restorePayload(bindings.SNIPFLOW_R2, key, previousMeta, previousPayload)
     } catch (rollbackError) {
       throw new AggregateError(
         [error, rollbackError],
@@ -107,7 +114,7 @@ export async function createSnip(
   }
 
   const countDelta = previousMeta ? 0 : 1
-  const sizeDelta = size - (previousMeta?.size ?? 0)
+  const sizeDelta = meta.size - (previousMeta?.size ?? 0)
 
   if (countDelta !== 0) {
     await incrementCounter(bindings.SNIPFLOW_KV, 'count', countDelta)

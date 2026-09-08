@@ -103,7 +103,7 @@ describe('Middleware Layer', () => {
     it('rejects POST /snip without content-type', async () => {
       const res = await exports.default.fetch('http://localhost/snip', {
         method: 'POST',
-        body: JSON.stringify({ test: 'data' }),
+        body: new Uint8Array([1, 2, 3]),
         headers: { 'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}` }
       })
       expect(res.status).toBe(415)
@@ -111,24 +111,26 @@ describe('Middleware Layer', () => {
       expect(json.error.code).toBe('UNSUPPORTED_MEDIA_TYPE')
     })
 
-    it('rejects POST /snip with text/plain', async () => {
+    it('accepts POST /snip with any MIME content type', async () => {
       const res = await exports.default.fetch('http://localhost/snip', {
         method: 'POST',
-        body: JSON.stringify({ test: 'data' }),
+        body: 'plain text',
         headers: {
           'content-type': 'text/plain',
+          'x-snip-source': 'page',
           'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`
         }
       })
-      expect(res.status).toBe(415)
+      expect(res.status).toBe(201)
     })
 
-    it('accepts POST /snip with application/json', async () => {
+    it('does not force JSON payloads into a special storage type', async () => {
       const res = await exports.default.fetch('http://localhost/snip', {
         method: 'POST',
         body: JSON.stringify({ test: 'data' }),
         headers: {
           'content-type': 'application/json',
+          'x-snip-source': 'page',
           'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`
         }
       })

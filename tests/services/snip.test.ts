@@ -1,6 +1,10 @@
 import { env } from 'cloudflare:workers'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { KeyConflictError, NotFoundError } from '../../src/domain/errors'
+import {
+  KeyConflictError,
+  NotFoundError,
+  PayloadTooLargeError,
+} from '../../src/domain/errors'
 import type { CreateSnipInput } from '../../src/domain/types'
 import { getSnip, setCounter } from '../../src/repositories/kv'
 import { deletePayload, getPayload, putPayload } from '../../src/repositories/r2'
@@ -10,7 +14,6 @@ import { listSnips } from '../../src/services/snip/list'
 import { readSnip } from '../../src/services/snip/read'
 import { getStats } from '../../src/services/stats'
 
-const textEncoder = new TextEncoder()
 const storageLimit = Number(env.SNIPFLOW_TOTAL_STORAGE_LIMIT)
 
 function bindings() {
@@ -23,13 +26,20 @@ function bindings() {
 function createInput(overrides: Partial<CreateSnipInput> = {}): CreateSnipInput {
   return {
     key: 'test-key',
-    type: 'text',
-    content: 'hello world',
     source: 'page',
     expiry: { mode: 'forever' },
     overwrite: false,
+    maxSize: 1024,
+    payload: 'hello world',
+    httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+    customMetadata: { source: 'page', filename: 'note.md' },
     ...overrides,
   }
+}
+
+async function payloadText(key: string): Promise<string | null> {
+  const payload = await getPayload(env.SNIPFLOW_R2, key)
+  return payload ? await payload.text() : null
 }
 
 async function clearStorage(): Promise<void> {
@@ -59,7 +69,7 @@ describe('createSnip', () => {
 
     expect(meta.key).toMatch(/^[0-9A-Za-z]{5}$/)
     expect(await getSnip(env.SNIPFLOW_KV, meta.key)).toEqual(meta)
-    expect(await getPayload(env.SNIPFLOW_R2, meta.key)).toBe('hello world')
+    expect(await payloadText(meta.key)).toBe('hello world')
   })
 
   it('keeps a caller-provided key', async () => {
@@ -84,26 +94,38 @@ describe('createSnip', () => {
   })
 
   it('rejects an existing custom key unless overwrite is enabled', async () => {
-    await createSnip(bindings(), createInput({ key: 'abc', content: 'old' }))
+    await createSnip(bindings(), createInput({ key: 'abc', payload: 'old' }))
 
     await expect(
-      createSnip(bindings(), createInput({ key: 'abc', content: 'new' }))
+      createSnip(bindings(), createInput({ key: 'abc', payload: 'new' }))
     ).rejects.toBeInstanceOf(KeyConflictError)
-    expect(await getPayload(env.SNIPFLOW_R2, 'abc')).toBe('old')
+    expect(await payloadText('abc')).toBe('old')
   })
 
-  it('overwrites content and adjusts size without incrementing count', async () => {
-    await createSnip(bindings(), createInput({ key: 'abc', content: 'old' }))
+  it('overwrites arbitrary payload and adjusts size without incrementing count', async () => {
+    await createSnip(bindings(), createInput({ key: 'abc', payload: 'old' }))
+    const bytes = new Uint8Array([0, 255, 4, 8])
     const meta = await createSnip(
       bindings(),
-      createInput({ key: 'abc', content: '你好', overwrite: true })
+      createInput({
+        key: 'abc',
+        payload: bytes,
+        overwrite: true,
+        httpMetadata: { contentType: 'application/x-test' },
+        customMetadata: { source: 'page', filename: 'sample.bin' },
+      })
     )
 
-    expect(await getPayload(env.SNIPFLOW_R2, 'abc')).toBe('你好')
-    expect(meta.size).toBe(textEncoder.encode('你好').byteLength)
+    const stored = await getPayload(env.SNIPFLOW_R2, 'abc')
+    expect(new Uint8Array(await stored!.arrayBuffer())).toEqual(bytes)
+    expect(meta).toMatchObject({
+      contentType: 'application/x-test',
+      filename: 'sample.bin',
+      size: 4,
+    })
     await expect(getStats(env)).resolves.toEqual({
       count: 1,
-      totalSize: 6,
+      totalSize: 4,
       storageLimit,
     })
   })
@@ -121,8 +143,8 @@ describe('createSnip', () => {
     expect(page.keys[0]?.expiration).toBeGreaterThanOrEqual(before + 3600)
   })
 
-  it('increments count and totalSize using UTF-8 bytes', async () => {
-    await createSnip(bindings(), createInput({ content: '你好' }))
+  it('increments count and totalSize using stored payload bytes', async () => {
+    await createSnip(bindings(), createInput({ payload: '你好' }))
 
     await expect(getStats(env)).resolves.toEqual({
       count: 1,
@@ -130,16 +152,54 @@ describe('createSnip', () => {
       storageLimit,
     })
   })
+
+  it('removes a new payload when its actual R2 size exceeds the limit', async () => {
+    await expect(createSnip(
+      bindings(),
+      createInput({ key: 'too-large', payload: 'hello', maxSize: 4 })
+    )).rejects.toBeInstanceOf(PayloadTooLargeError)
+
+    expect(await getSnip(env.SNIPFLOW_KV, 'too-large')).toBeNull()
+    expect(await getPayload(env.SNIPFLOW_R2, 'too-large')).toBeNull()
+  })
+
+  it('restores the previous object and metadata after an oversized overwrite', async () => {
+    const previous = await createSnip(
+      bindings(),
+      createInput({ key: 'restore-me', payload: 'old' })
+    )
+
+    await expect(createSnip(
+      bindings(),
+      createInput({
+        key: 'restore-me',
+        payload: 'new content',
+        overwrite: true,
+        maxSize: 3,
+        httpMetadata: { contentType: 'application/x-new' },
+        customMetadata: { source: 'page', filename: 'new.bin' },
+      })
+    )).rejects.toBeInstanceOf(PayloadTooLargeError)
+
+    expect(await payloadText('restore-me')).toBe('old')
+    expect(await getSnip(env.SNIPFLOW_KV, 'restore-me')).toEqual(previous)
+    const restored = await getPayload(env.SNIPFLOW_R2, 'restore-me')
+    expect(restored?.httpMetadata?.contentType).toBe('text/markdown; charset=utf-8')
+    expect(restored?.customMetadata?.filename).toBe('note.md')
+  })
 })
 
 describe('readSnip', () => {
   it('returns metadata and payload content', async () => {
     const created = await createSnip(bindings(), createInput())
 
-    await expect(readSnip(bindings(), created.key)).resolves.toEqual({
-      meta: created,
-      content: 'hello world',
-    })
+    const result = await readSnip(bindings(), created.key)
+
+    expect(result.meta).toEqual(created)
+    expect(await result.payload.text()).toBe('hello world')
+    expect(result.payload.httpMetadata?.contentType)
+      .toBe('text/markdown; charset=utf-8')
+    expect(result.payload.customMetadata?.filename).toBe('note.md')
   })
 
   it('throws NotFoundError when metadata or payload is missing', async () => {
@@ -167,7 +227,7 @@ describe('listSnips', () => {
 
 describe('deleteSnip', () => {
   it('deletes KV before R2 and decrements counters', async () => {
-    await createSnip(bindings(), createInput({ key: 'delete-me', content: '你好' }))
+    await createSnip(bindings(), createInput({ key: 'delete-me', payload: '你好' }))
 
     await deleteSnip(bindings(), 'delete-me')
 
@@ -198,7 +258,7 @@ describe('getStats', () => {
   })
 
   it('does not confuse an R2 object without metadata for a listed snip', async () => {
-    await putPayload(env.SNIPFLOW_R2, 'orphan', 'content', 'text/plain')
+    await putPayload(env.SNIPFLOW_R2, 'orphan', 'content')
 
     await expect(listSnips(bindings())).resolves.toEqual({ items: [] })
   })

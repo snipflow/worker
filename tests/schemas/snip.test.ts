@@ -1,21 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
-  CreateSnipSchema,
-  ExpirySchema,
+  CreateSnipHeadersSchema,
   ListSnipsQuerySchema,
   SnipKeyParamsSchema,
-  createCreateSnipSchema,
 } from '../../src/schemas/snip'
 
-const validRequest = {
+const validHeaders = {
   key: 'my-note',
-  type: 'text' as const,
-  content: 'hello world',
   source: 'page',
-  expiry: { mode: 'ttl' as const, ttl: 86400 },
+  overwrite: 'false',
+  contentType: 'application/vnd.snipflow.document+json; charset=utf-8',
 }
 
-function expectIssuePath(result: ReturnType<typeof CreateSnipSchema.safeParse>, path: PropertyKey[]) {
+function expectIssuePath(
+  result: ReturnType<typeof CreateSnipHeadersSchema.safeParse>,
+  path: PropertyKey[]
+) {
   expect(result.success).toBe(false)
   if (!result.success) {
     expect(result.error.issues).toEqual(
@@ -24,80 +24,60 @@ function expectIssuePath(result: ReturnType<typeof CreateSnipSchema.safeParse>, 
   }
 }
 
-describe('ExpirySchema', () => {
-  it('accepts forever expiry', () => {
-    expect(ExpirySchema.safeParse({ mode: 'forever' }).success).toBe(true)
-  })
-
-  it('rejects ttl expiry without ttl at expiry.ttl', () => {
-    const result = CreateSnipSchema.safeParse({
-      ...validRequest,
-      expiry: { mode: 'ttl' },
+describe('CreateSnipHeadersSchema', () => {
+  it('accepts arbitrary valid MIME types and maps header values', () => {
+    const result = CreateSnipHeadersSchema.safeParse({
+      ...validHeaders,
+      filename: '报告.data',
+      ttl: '86400',
+      cacheExpiry: 'Wed, 21 Oct 2026 07:28:00 GMT',
     })
-
-    expectIssuePath(result, ['expiry', 'ttl'])
-  })
-
-  it('rejects fields that do not belong to forever expiry', () => {
-    expect(ExpirySchema.safeParse({ mode: 'forever', ttl: 60 }).success).toBe(false)
-  })
-})
-
-describe('CreateSnipSchema', () => {
-  it('accepts a valid request and defaults overwrite to false', () => {
-    const result = CreateSnipSchema.safeParse(validRequest)
 
     expect(result.success).toBe(true)
     if (result.success) {
       expect(result.data.overwrite).toBe(false)
+      expect(result.data.ttl).toBe(86400)
+      expect(result.data.cacheExpiry).toEqual(new Date('2026-10-21T07:28:00.000Z'))
     }
   })
 
-  it('rejects an unsupported type at type', () => {
-    const result = CreateSnipSchema.safeParse({
-      ...validRequest,
-      type: 'link',
+  it('rejects a malformed MIME type', () => {
+    const result = CreateSnipHeadersSchema.safeParse({
+      ...validHeaders,
+      contentType: 'not-a-media-type',
     })
 
-    expectIssuePath(result, ['type'])
+    expectIssuePath(result, ['contentType'])
   })
 
-  it('rejects empty content at content', () => {
-    const result = CreateSnipSchema.safeParse({
-      ...validRequest,
-      content: '',
+  it('rejects missing source and invalid control headers', () => {
+    const missingSource = CreateSnipHeadersSchema.safeParse({
+      ...validHeaders,
+      source: null,
+    })
+    const invalidOverwrite = CreateSnipHeadersSchema.safeParse({
+      ...validHeaders,
+      overwrite: 'yes',
+    })
+    const invalidTtl = CreateSnipHeadersSchema.safeParse({
+      ...validHeaders,
+      ttl: '0',
     })
 
-    expectIssuePath(result, ['content'])
-  })
-
-  it('limits content by UTF-8 bytes', () => {
-    const schema = createCreateSnipSchema(5)
-
-    expect(schema.safeParse({ ...validRequest, content: 'hello' }).success).toBe(true)
-
-    const result = schema.safeParse({ ...validRequest, content: '你好' })
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.error.issues).toEqual(
-        expect.arrayContaining([expect.objectContaining({ path: ['content'] })])
-      )
-    }
-  })
-
-  it('rejects an invalid maximum size when the schema is constructed', () => {
-    expect(() => createCreateSnipSchema(0)).toThrow(RangeError)
-    expect(() => createCreateSnipSchema(Number.NaN)).toThrow(RangeError)
+    expectIssuePath(missingSource, ['source'])
+    expectIssuePath(invalidOverwrite, ['overwrite'])
+    expectIssuePath(invalidTtl, ['ttl'])
   })
 
   it('accepts an empty key for server-side generation', () => {
-    expect(CreateSnipSchema.safeParse({ ...validRequest, key: '' }).success).toBe(true)
+    expect(CreateSnipHeadersSchema.safeParse({ ...validHeaders, key: '' }).success)
+      .toBe(true)
   })
 
   it.each(['with/slash', 'with space', 'a'.repeat(129)])(
     'rejects invalid custom key %s',
     key => {
-      const result = CreateSnipSchema.safeParse({ ...validRequest, key })
+      const result = CreateSnipHeadersSchema.safeParse({ ...validHeaders, key })
       expectIssuePath(result, ['key'])
     }
   )

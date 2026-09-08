@@ -4,7 +4,8 @@ import type { SnipMeta } from '../domain/types'
 
 const SnipMetaSchema = z.strictObject({
   key: z.string().min(1),
-  type: z.enum(['text', 'image', 'file']),
+  contentType: z.string().min(1),
+  filename: z.string().min(1).nullable(),
   source: z.string().min(1),
   size: z.number().int().nonnegative(),
   createdAt: z.iso.datetime({ offset: true }),

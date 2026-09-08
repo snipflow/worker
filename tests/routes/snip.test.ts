@@ -10,24 +10,25 @@ interface ErrorResponse {
   }
 }
 
-const authHeaders = {
+const authHeaders: Record<string, string> = {
   Authorization: 'Bearer ' + env.SNIPFLOW_API_TOKEN,
 }
-const jsonHeaders = {
-  ...authHeaders,
-  'content-type': 'application/json',
-}
 
-function createBody(overrides: Record<string, unknown> = {}) {
-  return {
-    key: 'route-test',
-    type: 'text',
-    content: 'hello world',
-    source: 'page',
-    expiry: { mode: 'forever' },
-    overwrite: false,
-    ...overrides,
+function uploadHeaders(overrides: Record<string, string | null> = {}): Headers {
+  const headers = new Headers({
+    ...authHeaders,
+    'Content-Type': 'text/markdown; charset=utf-8',
+    'X-Snip-Key': 'route-test',
+    'X-Snip-Source': 'page',
+    'X-Snip-Filename': '%E8%AF%B4%E6%98%8E.md',
+  })
+
+  for (const [name, value] of Object.entries(overrides)) {
+    if (value === null) headers.delete(name)
+    else headers.set(name, value)
   }
+
+  return headers
 }
 
 async function clearStorage(): Promise<void> {
@@ -51,86 +52,150 @@ async function clearStorage(): Promise<void> {
   ])
 }
 
-async function create(overrides: Record<string, unknown> = {}): Promise<Response> {
+async function create(
+  payload: BodyInit = 'hello world',
+  headers: Record<string, string | null> = {}
+): Promise<Response> {
   return exports.default.fetch('http://localhost/snip', {
     method: 'POST',
-    headers: jsonHeaders,
-    body: JSON.stringify(createBody(overrides)),
+    headers: uploadHeaders(headers),
+    body: payload,
   })
 }
 
 beforeEach(clearStorage)
 
 describe('snip routes', () => {
-  it('creates a snip and exposes only its public metadata', async () => {
-    const response = await create()
+  it('maps request headers to R2 HTTP metadata and custom metadata', async () => {
+    const response = await create('hello world', {
+      'Content-Language': 'zh-CN',
+      'Cache-Control': 'private, max-age=60',
+      'Expires': 'Wed, 21 Oct 2026 07:28:00 GMT',
+      'X-Snip-Meta-Category': 'document',
+    })
     const json = await response.json() as Record<string, unknown>
+    const stored = await env.SNIPFLOW_R2.get('snips/route-test/payload')
 
     expect(response.status).toBe(201)
     expect(json).toMatchObject({
       key: 'route-test',
-      type: 'text',
+      contentType: 'text/markdown; charset=utf-8',
+      filename: '说明.md',
       source: 'page',
       size: 11,
       expiresAt: null,
     })
     expect(json.createdAt).toEqual(expect.any(String))
     expect(json).not.toHaveProperty('r2Key')
-    expect(await env.SNIPFLOW_R2.get('snips/route-test/payload')).not.toBeNull()
+    expect(stored?.httpMetadata).toMatchObject({
+      contentType: 'text/markdown; charset=utf-8',
+      contentLanguage: 'zh-CN',
+      cacheControl: 'private, max-age=60',
+      cacheExpiry: new Date('2026-10-21T07:28:00.000Z'),
+    })
+    expect(stored?.customMetadata).toEqual({
+      category: 'document',
+      filename: '说明.md',
+      source: 'page',
+    })
+    expect(stored?.customMetadata).not.toHaveProperty('authorization')
   })
 
-  it('returns structured Zod issues for invalid input', async () => {
-    const response = await exports.default.fetch('http://localhost/snip', {
-      method: 'POST',
-      headers: jsonHeaders,
-      body: JSON.stringify({ key: 'missing-fields' }),
-    })
-    const json = await response.json() as ErrorResponse
+  it('accepts arbitrary binary content and returns it without conversion', async () => {
+    const bytes = new Uint8Array([0, 255, 1, 128, 42])
+    expect((await create(bytes, {
+      'Content-Type': 'application/vnd.example.binary',
+      'X-Snip-Filename': 'sample.bin',
+    })).status).toBe(201)
 
-    expect(response.status).toBe(400)
-    expect(json.error.code).toBe('INVALID_INPUT')
-    expect(json.error.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: ['content'] }),
+    const response = await exports.default.fetch('http://localhost/snip', {
+      headers: authHeaders,
+    })
+    const list = await response.json() as {
+      items: Array<Record<string, unknown>>
+    }
+    expect(list.items[0]).toMatchObject({
+      contentType: 'application/vnd.example.binary',
+      filename: 'sample.bin',
+      size: 5,
+    })
+
+    const read = await exports.default.fetch(
+      'http://localhost/snip/route-test',
+      { headers: authHeaders }
+    )
+    expect(new Uint8Array(await read.arrayBuffer())).toEqual(bytes)
+    expect(read.headers.get('content-type')).toBe('application/vnd.example.binary')
+    expect(read.headers.get('content-disposition'))
+      .toBe("attachment; filename*=UTF-8''sample.bin")
+  })
+
+  it('returns structured issues for missing or invalid metadata headers', async () => {
+    const missingSource = await create('content', {
+      'X-Snip-Source': null,
+    })
+    const missingSourceJson = await missingSource.json() as ErrorResponse
+
+    expect(missingSource.status).toBe(400)
+    expect(missingSourceJson.error.code).toBe('INVALID_INPUT')
+    expect(missingSourceJson.error.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: ['source'] }),
     ]))
+
+    const malformedType = await create('content', {
+      'Content-Type': 'invalid',
+    })
+    expect(malformedType.status).toBe(400)
+    expect(((await malformedType.json()) as ErrorResponse).error.issues)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: ['contentType'] }),
+      ]))
   })
 
-  it('returns INVALID_INPUT for malformed JSON', async () => {
+  it('requires a Content-Type but accepts every valid MIME type', async () => {
     const response = await exports.default.fetch('http://localhost/snip', {
       method: 'POST',
-      headers: jsonHeaders,
-      body: '{',
+      headers: {
+        ...authHeaders,
+        'X-Snip-Source': 'page',
+      },
+      body: new Uint8Array([1, 2, 3]),
     })
-    const json = await response.json() as ErrorResponse
 
-    expect(response.status).toBe(400)
-    expect(json.error.code).toBe('INVALID_INPUT')
-    expect(json.error.issues).toHaveLength(1)
+    expect(response.status).toBe(415)
+    expect(((await response.json()) as ErrorResponse).error.code)
+      .toBe('UNSUPPORTED_MEDIA_TYPE')
   })
 
   it('reports conflicts and allows explicit overwrite', async () => {
     expect((await create()).status).toBe(201)
 
-    const conflict = await create({ content: 'new content' })
+    const conflict = await create('new content')
     expect(conflict.status).toBe(409)
     expect(((await conflict.json()) as ErrorResponse).error.code).toBe('KEY_CONFLICT')
 
-    const overwritten = await create({ content: 'new content', overwrite: true })
+    const overwritten = await create('new content', {
+      'X-Snip-Overwrite': 'true',
+    })
     expect(overwritten.status).toBe(201)
     expect(await overwritten.json()).toMatchObject({ size: 11 })
   })
 
-  it('reads an existing snip without leaking r2Key', async () => {
+  it('streams an existing snip with stored HTTP metadata and a safe filename', async () => {
     await create()
 
     const response = await exports.default.fetch(
       'http://localhost/snip/route-test',
       { headers: authHeaders }
     )
-    const json = await response.json() as Record<string, unknown>
 
     expect(response.status).toBe(200)
-    expect(json).toMatchObject({ key: 'route-test', content: 'hello world' })
-    expect(json).not.toHaveProperty('r2Key')
+    expect(await response.text()).toBe('hello world')
+    expect(response.headers.get('content-type')).toBe('text/markdown; charset=utf-8')
+    expect(response.headers.get('content-length')).toBe('11')
+    expect(response.headers.get('content-disposition'))
+      .toBe("attachment; filename*=UTF-8''%E8%AF%B4%E6%98%8E.md")
+    expect(response.headers.get('etag')).toBeTruthy()
   })
 
   it('returns NOT_FOUND for an unknown snip', async () => {
@@ -157,7 +222,7 @@ describe('snip routes', () => {
   })
 
   it('supports the complete create, read, list, delete lifecycle', async () => {
-    expect((await create()).status).toBe(201)
+    expect((await create('hello lifecycle')).status).toBe(201)
 
     const read = await exports.default.fetch('http://localhost/snip/route-test', {
       headers: authHeaders,
@@ -173,10 +238,15 @@ describe('snip routes', () => {
     }
     expect(listed.status).toBe(200)
     expect(listJson.items).toHaveLength(1)
-    expect(listJson.items[0]).toMatchObject({ key: 'route-test', size: 11 })
-    expect(listJson.items[0]).not.toHaveProperty('content')
+    expect(listJson.items[0]).toMatchObject({
+      key: 'route-test',
+      contentType: 'text/markdown; charset=utf-8',
+      filename: '说明.md',
+      size: 15,
+    })
     expect(listJson.items[0]).not.toHaveProperty('source')
     expect(listJson.items[0]).not.toHaveProperty('r2Key')
+    expect(listJson.items[0]).not.toHaveProperty('content')
 
     const deleted = await exports.default.fetch(
       'http://localhost/snip/route-test',

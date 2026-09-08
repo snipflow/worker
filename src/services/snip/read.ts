@@ -10,7 +10,7 @@ type ReadSnipBindings = Pick<
 
 export interface ReadSnipResult {
   meta: SnipMeta
-  content: string
+  payload: R2ObjectBody
 }
 
 export async function readSnip(
@@ -20,8 +20,8 @@ export async function readSnip(
   const meta = await getSnip(bindings.SNIPFLOW_KV, key)
   if (!meta) throw new NotFoundError('Snip not found')
 
-  const content = await getPayload(bindings.SNIPFLOW_R2, key)
-  if (content === null) throw new NotFoundError('Snip payload not found')
+  const payload = await getPayload(bindings.SNIPFLOW_R2, key)
+  if (payload === null) throw new NotFoundError('Snip payload not found')
 
-  return { meta, content }
+  return { meta, payload }
 }

@@ -4,18 +4,26 @@ import type {
   CreateSnipResponse,
   ListSnipItem,
   ListSnipsResponse,
-  ReadSnipResponse,
   SnipMeta,
 } from '../domain/types'
 import {
+  CreateSnipHeadersSchema,
   ListSnipsQuerySchema,
   SnipKeyParamsSchema,
-  createCreateSnipSchema,
 } from '../schemas/snip'
 import { createSnip } from '../services/snip/create'
 import { deleteSnip } from '../services/snip/delete'
 import { listSnips } from '../services/snip/list'
 import { readSnip } from '../services/snip/read'
+import { maxSnipSize } from '../middleware/guard'
+import {
+  MAX_CUSTOM_METADATA_SIZE,
+  contentDispositionForFilename,
+  createCustomMetadata,
+  customMetadataSize,
+  filenameFromContentDisposition,
+  filenameFromHeader,
+} from '../utils/r2-metadata'
 
 const snipRoutes = new Hono<{ Bindings: CloudflareBindings }>()
 
@@ -26,7 +34,8 @@ function invalidInput(issues: readonly unknown[]): InvalidInputError {
 function toCreateResponse(meta: SnipMeta): CreateSnipResponse {
   return {
     key: meta.key,
-    type: meta.type,
+    contentType: meta.contentType,
+    filename: meta.filename,
     source: meta.source,
     size: meta.size,
     createdAt: meta.createdAt,
@@ -37,7 +46,8 @@ function toCreateResponse(meta: SnipMeta): CreateSnipResponse {
 function toListItem(meta: SnipMeta): ListSnipItem {
   return {
     key: meta.key,
-    type: meta.type,
+    contentType: meta.contentType,
+    filename: meta.filename,
     size: meta.size,
     createdAt: meta.createdAt,
     expiresAt: meta.expiresAt,
@@ -45,22 +55,67 @@ function toListItem(meta: SnipMeta): ListSnipItem {
 }
 
 snipRoutes.post('/', async c => {
-  let body: unknown
-  try {
-    body = await c.req.json()
-  } catch {
-    throw invalidInput([
-      { code: 'invalid_json', path: [], message: '请求体必须是合法 JSON' },
-    ])
-  }
-
-  const schema = createCreateSnipSchema(Number(c.env.SNIPFLOW_MAX_SNIP_SIZE))
-  const parsed = schema.safeParse(body)
+  const headers = c.req.raw.headers
+  const contentDisposition = headers.get('content-disposition') ?? undefined
+  const parsed = CreateSnipHeadersSchema.safeParse({
+    key: headers.get('x-snip-key') ?? '',
+    source: headers.get('x-snip-source'),
+    filename:
+      filenameFromHeader(headers.get('x-snip-filename') ?? undefined)
+      ?? filenameFromContentDisposition(contentDisposition),
+    ttl: headers.get('x-snip-ttl') ?? undefined,
+    overwrite: headers.get('x-snip-overwrite') ?? 'false',
+    contentType: headers.get('content-type'),
+    contentLanguage: headers.get('content-language') ?? undefined,
+    contentDisposition,
+    contentEncoding: headers.get('content-encoding') ?? undefined,
+    cacheControl: headers.get('cache-control') ?? undefined,
+    cacheExpiry: headers.get('expires') ?? undefined,
+  })
   if (!parsed.success) {
     throw invalidInput(parsed.error.issues)
   }
 
-  const meta = await createSnip(c.env, parsed.data)
+  const httpMetadata: R2HTTPMetadata = {
+    contentType: parsed.data.contentType,
+    ...(parsed.data.contentLanguage
+      ? { contentLanguage: parsed.data.contentLanguage }
+      : {}),
+    ...(parsed.data.contentDisposition
+      ? { contentDisposition: parsed.data.contentDisposition }
+      : {}),
+    ...(parsed.data.contentEncoding
+      ? { contentEncoding: parsed.data.contentEncoding }
+      : {}),
+    ...(parsed.data.cacheControl ? { cacheControl: parsed.data.cacheControl } : {}),
+    ...(parsed.data.cacheExpiry ? { cacheExpiry: parsed.data.cacheExpiry } : {}),
+  }
+  const customMetadata = createCustomMetadata(
+    headers,
+    parsed.data.source,
+    parsed.data.filename
+  )
+  if (customMetadataSize(customMetadata) > MAX_CUSTOM_METADATA_SIZE) {
+    throw invalidInput([{
+      code: 'too_big',
+      path: ['headers'],
+      message: `R2 custom metadata 不得超过 ${MAX_CUSTOM_METADATA_SIZE} 字节`,
+    }])
+  }
+
+  const maximumSize = maxSnipSize(c.env)
+  const meta = await createSnip(c.env, {
+    key: parsed.data.key,
+    source: parsed.data.source,
+    expiry: parsed.data.ttl
+      ? { mode: 'ttl', ttl: parsed.data.ttl }
+      : { mode: 'forever' },
+    overwrite: parsed.data.overwrite,
+    maxSize: maximumSize,
+    payload: c.req.raw.body,
+    httpMetadata,
+    customMetadata,
+  })
   return c.json(toCreateResponse(meta), 201)
 })
 
@@ -86,12 +141,22 @@ snipRoutes.get('/:key', async c => {
   }
 
   const result = await readSnip(c.env, parsed.data.key)
-  const response = {
-    ...toCreateResponse(result.meta),
-    content: result.content,
-  } satisfies ReadSnipResponse
+  const headers = new Headers()
+  result.payload.writeHttpMetadata(headers)
+  headers.set('ETag', result.payload.httpEtag)
+  headers.set('Content-Length', String(result.payload.size))
+  if (!headers.has('Content-Type')) {
+    headers.set('Content-Type', result.meta.contentType)
+  }
 
-  return c.json(response)
+  const filename =
+    result.payload.customMetadata?.filename
+    ?? result.meta.filename
+  if (filename && !headers.has('Content-Disposition')) {
+    headers.set('Content-Disposition', contentDispositionForFilename(filename))
+  }
+
+  return new Response(result.payload.body, { headers })
 })
 
 snipRoutes.delete('/:key', async c => {

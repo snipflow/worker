@@ -5,16 +5,26 @@ export type SnipExpiry =
   | { mode: 'forever' }
   | { mode: 'ttl'; ttl: number }
 
+export type SnipPayload =
+  | ReadableStream
+  | ArrayBuffer
+  | ArrayBufferView
+  | string
+  | null
+  | Blob
+
 /**
  * 创建 Snip 的请求输入
  */
 export interface CreateSnipInput {
   key: string
-  type: 'text' | 'image' | 'file'
-  content: string
   source: string
   expiry: SnipExpiry
-  overwrite?: boolean // 可选，为 true 时强制覆盖已存在的 key
+  overwrite: boolean
+  maxSize: number
+  payload: SnipPayload
+  httpMetadata: R2HTTPMetadata
+  customMetadata: Record<string, string>
 }
 
 /**
@@ -22,7 +32,8 @@ export interface CreateSnipInput {
  */
 export interface SnipMeta {
   key: string
-  type: 'text' | 'image' | 'file'
+  contentType: string
+  filename: string | null
   source: string
   size: number
   createdAt: string
@@ -36,18 +47,11 @@ export interface SnipMeta {
 export type CreateSnipResponse = Omit<SnipMeta, 'r2Key'>
 
 /**
- * 读取成功响应 DTO
- */
-export type ReadSnipResponse = CreateSnipResponse & {
-  content: string
-}
-
-/**
  * 列表项 DTO
  */
 export type ListSnipItem = Pick<
   SnipMeta,
-  'key' | 'type' | 'size' | 'createdAt' | 'expiresAt'
+  'key' | 'contentType' | 'filename' | 'size' | 'createdAt' | 'expiresAt'
 >
 
 export interface ListSnipsResponse {

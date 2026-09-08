@@ -1,10 +1,4 @@
 import { z } from 'zod'
-import type { CreateSnipInput, SnipExpiry } from '../domain/types'
-
-export const DEFAULT_MAX_SNIP_SIZE = 10 * 1024 * 1024
-
-const utf8Encoder = new TextEncoder()
-const SnipTypeSchema = z.enum(['text', 'image', 'file'])
 
 export const SnipKeySchema = z
   .string()
@@ -20,37 +14,49 @@ export const ListSnipsQuerySchema = z.strictObject({
   cursor: z.string().min(1, { error: 'cursor 不得为空' }).optional(),
 })
 
-export const ExpirySchema = z.discriminatedUnion('mode', [
-  z.strictObject({ mode: z.literal('forever') }),
-  z.strictObject({
-    mode: z.literal('ttl'),
-    ttl: z.number().int().positive(),
-  }),
-]) satisfies z.ZodType<SnipExpiry>
+const MediaTypeSchema = z
+  .string()
+  .min(1, { error: 'Content-Type 不得为空' })
+  .refine(
+    value => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:\s*;.*)?$/.test(value),
+    { error: 'Content-Type 必须是合法的 MIME 类型' }
+  )
+
+const PositiveIntegerHeaderSchema = z
+  .string()
+  .regex(/^\d+$/, { error: 'X-Snip-TTL 必须是正整数秒数' })
+  .transform(Number)
+  .pipe(z.number().int().positive())
+
+const HttpDateSchema = z
+  .string()
+  .refine(value => Number.isFinite(Date.parse(value)), {
+    error: 'Expires 必须是合法的 HTTP 日期',
+  })
+  .transform(value => new Date(value))
 
 /**
- * 构造创建请求 Schema。
- * maxSnipSize 以 UTF-8 字节数计，与 R2 中记录的 payload 大小保持一致。
+ * POST /snip 的控制参数和 R2 HTTP metadata 均来自请求头。
+ * 缺少 X-Snip-Key 时由服务端生成 key，缺少 X-Snip-TTL 时永久保存。
  */
-export function createCreateSnipSchema(maxSnipSize: number) {
-  if (!Number.isSafeInteger(maxSnipSize) || maxSnipSize <= 0) {
-    throw new RangeError('maxSnipSize must be a positive safe integer')
-  }
+export const CreateSnipHeadersSchema = z.strictObject({
+  key: z.union([z.literal(''), SnipKeySchema]),
+  source: z.string().min(1, { error: 'X-Snip-Source 不得为空' }).max(256),
+  filename: z
+    .string()
+    .min(1, { error: 'X-Snip-Filename 不得为空' })
+    .max(1024)
+    .optional(),
+  ttl: PositiveIntegerHeaderSchema.optional(),
+  overwrite: z
+    .enum(['true', 'false'], { error: 'X-Snip-Overwrite 必须是 true 或 false' })
+    .transform(value => value === 'true'),
+  contentType: MediaTypeSchema,
+  contentLanguage: z.string().min(1).optional(),
+  contentDisposition: z.string().min(1).optional(),
+  contentEncoding: z.string().min(1).optional(),
+  cacheControl: z.string().min(1).optional(),
+  cacheExpiry: HttpDateSchema.optional(),
+})
 
-  return z.strictObject({
-    key: z.union([z.literal(''), SnipKeySchema]),
-    type: SnipTypeSchema,
-    content: z
-      .string()
-      .min(1, { error: 'content 不得为空' })
-      .refine(content => utf8Encoder.encode(content).byteLength <= maxSnipSize, {
-        error: `content 不得超过 ${maxSnipSize} 字节`,
-      }),
-    source: z.string().min(1, { error: 'source 不得为空' }),
-    expiry: ExpirySchema,
-    overwrite: z.boolean().optional().default(false),
-  }) satisfies z.ZodType<CreateSnipInput>
-}
-
-/** 默认 Schema；路由层应使用 createCreateSnipSchema 传入环境变量中的上限。 */
-export const CreateSnipSchema = createCreateSnipSchema(DEFAULT_MAX_SNIP_SIZE)
+export type ParsedCreateSnipHeaders = z.infer<typeof CreateSnipHeadersSchema>

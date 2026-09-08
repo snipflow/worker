@@ -20,7 +20,8 @@ describe('KV Repository', () => {
     it('should write and read snip metadata', async () => {
       const meta: SnipMeta = {
         key: 'test-key',
-        type: 'text',
+        contentType: 'text/plain',
+        filename: null,
         source: 'page',
         size: 100,
         createdAt: new Date().toISOString(),
@@ -52,7 +53,8 @@ describe('KV Repository', () => {
     it('should support TTL expiration', async () => {
       const meta: SnipMeta = {
         key: 'ttl-key',
-        type: 'text',
+        contentType: 'application/pdf',
+        filename: 'report.pdf',
         source: 'page',
         size: 50,
         createdAt: new Date().toISOString(),
@@ -70,7 +72,8 @@ describe('KV Repository', () => {
     it('should return true for existing key', async () => {
       const meta: SnipMeta = {
         key: 'exists',
-        type: 'text',
+        contentType: 'text/plain',
+        filename: null,
         source: 'page',
         size: 10,
         createdAt: new Date().toISOString(),
@@ -93,7 +96,8 @@ describe('KV Repository', () => {
     it('should delete snip metadata', async () => {
       const meta: SnipMeta = {
         key: 'delete-me',
-        type: 'text',
+        contentType: 'text/plain',
+        filename: null,
         source: 'page',
         size: 20,
         createdAt: new Date().toISOString(),
@@ -115,7 +119,8 @@ describe('KV Repository', () => {
       for (const key of keys) {
         const meta: SnipMeta = {
           key,
-          type: 'text',
+          contentType: 'text/plain',
+          filename: null,
           source: 'page',
           size: 10,
           createdAt: new Date().toISOString(),

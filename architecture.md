@@ -2,7 +2,7 @@
 
 ## 1. 职责
 
-worker 是 Snipflow 的统一后端服务。它接收来自 Pages 前端、Telegram Bot 以及未来其他客户端的授权请求，对 snip 数据进行规范化处理，并将元数据存入 Cloudflare KV、内容负载存入 Cloudflare R2。
+worker 是 Snipflow 的统一后端服务。它接收来自 Pages 前端、Telegram Bot 以及未来其他客户端的授权请求，将原始请求体和对象元数据存入 Cloudflare R2，并将用于查询、TTL 和统计的索引元数据存入 Cloudflare KV。
 
 第一版中，后端不将 page 和 bot-tg 视为独立的安全域。所有客户端使用相同的公开 API 结构和相同的服务端 Token 验证模型。`source` 字段仅作为记录来源的元数据，不作为权限控制依据。
 
@@ -22,17 +22,20 @@ worker 是 Snipflow 的统一后端服务。它接收来自 Pages 前端、Teleg
 
 ## 3. 请求流程
 
-```
-请求
-  -> 守卫中间件（方法过滤 / 体积限制 / Request ID）
+~~~
+HTTP 请求
+  -> Request ID / Content-Length 预检 / 方法过滤
   -> Token 认证中间件（Bearer 校验）
-  -> Schema 校验（Zod）
+  -> Content-Type 存在性检查
+  -> 请求头、路径参数、查询参数校验（Zod）
   -> 资源路由（/snip、/stats）
   -> 服务层（业务逻辑）
   -> 仓储层（KV + R2 访问封装）
-  -> Cloudflare KV / R2
-  -> JSON 响应
-```
+  -> 原始请求体流式写入 R2，索引写入 KV
+  -> JSON 元数据响应或原始对象流响应
+~~~
+
+`POST /snip` 的请求体就是待存储对象，不经过 JSON 包装，也不转换为字符串。文本、图片、文档、自定义二进制和 JSON 都走同一条链路，由请求的 `Content-Type` 描述格式。
 
 ## 4. 守卫策略
 
@@ -42,9 +45,9 @@ worker 是 Snipflow 的统一后端服务。它接收来自 Pages 前端、Teleg
 
 通过环境变量 `SNIPFLOW_DISGUISE=true` 开启伪装模式。开启后，所有未通过守卫的请求均返回 `200 OK` 的 Hello World 页面，不暴露任何错误信息；真实错误原因仅写入后端日志（`console.error`）。关闭时（默认），返回标准 JSON 错误结构。
 
-伪装模式在全局错误处理器 (`app.onError`) 中统一实现，不在各个中间件中重复判断：
+伪装模式在全局错误处理器（`app.onError`）中统一实现，不在各个中间件中重复判断：
 
-```ts
+~~~ts
 // domain/errors.ts 中的 handleError 函数
 export function handleError(err: Error, c: Context) {
   const requestId = c.get('requestId')
@@ -59,43 +62,50 @@ export function handleError(err: Error, c: Context) {
   }
   // ...
 }
-```
+~~~
 
 ### 4.2 守卫职责与 Hono 工具栈
-
-每项守卫职责均有对应的 Hono 内置中间件或三方包，优先使用现有实现，不重复造轮子：
 
 | 职责 | 实现方式 |
 |------|---------|
 | 生成 / 透传 Request ID | [`hono/request-id`](https://hono.dev/docs/middleware/builtin/request-id) 内置中间件，通过 `c.get('requestId')` 获取，自动写入响应头 `X-Request-Id` |
-| Bearer Token 认证 | [`hono/bearer-auth`](https://hono.dev/docs/middleware/builtin/bearer-auth) 内置中间件，支持 `verifyToken` 自定义校验逻辑，通过 `invalidToken` / `noAuthenticationHeader` 回调抛出 `UnauthorizedError` |
-| 请求体大小限制 | [`hono/body-limit`](https://hono.dev/docs/middleware/builtin/body-limit) 内置中间件，`maxSize` 硬编码为 100 MB（Cloudflare Workers Free 计划的平台硬限制），`onError` 回调抛出 `PayloadTooLargeError`。单个 snip 的 `content` 字段大小由环境变量 `SNIPFLOW_MAX_SNIP_SIZE` 限制（默认 10 MB），在 Schema 层通过 Zod 校验 |
-| 方法过滤 | 自定义中间件，检查 `c.req.method` 是否在白名单内（GET/POST/DELETE），不在则抛出 `MethodNotAllowedError` |
-| Content-Type 校验 | 自定义中间件，仅对 POST / PUT 请求校验 `application/json`，不匹配则抛出 `UnsupportedMediaTypeError` |
-| 统一 JSON 错误响应 | Hono `app.onError` 全局错误处理器，捕获所有 `AppError` 子类，根据伪装模式返回 JSON 错误或 Hello World 页面 |
+| Bearer Token 认证 | [`hono/bearer-auth`](https://hono.dev/docs/middleware/builtin/bearer-auth) 内置中间件，通过 `invalidToken` / `noAuthenticationHeader` 回调抛出 `UnauthorizedError` |
+| 请求体大小限制 | 自定义 `bodyLimitGuard` 读取 `SNIPFLOW_MAX_SNIP_SIZE`。有 `Content-Length` 时在写入前预检；无该头时在 R2 写入后以 `R2Object.size` 最终校验 |
+| 方法过滤 | 自定义中间件，只允许 GET、POST、DELETE，其余方法抛出 `MethodNotAllowedError` |
+| Content-Type 校验 | 自定义中间件要求 POST / PUT 带 `Content-Type`，不限制具体 MIME；MIME 语法随后由 Zod 校验 |
+| 统一错误响应 | Hono `app.onError` 捕获所有 `AppError`，根据伪装模式返回 JSON 错误或 Hello World 页面 |
 
-**中间件挂载顺序：**
+中间件挂载顺序与当前 `app.ts` 一致：
 
-```ts
-app.use('*', requestId())           // 1. 先生成 Request ID，后续日志都能带上
-app.use('*', bodyLimit({ maxSize: 100 * 1024 * 1024, onError: () => { throw new PayloadTooLargeError() } }))
-app.use('*', methodGuard)           // 3. 方法过滤
-app.use('/snip/*', createAuthMiddleware(c.env))
-app.use('/stats', createAuthMiddleware(c.env))
-app.use('/snip', contentTypeGuard)  // 6. 仅 POST 请求校验
-```
+~~~ts
+app.use('*', requestIdMiddleware)
+app.use('*', bodyLimitGuard)
+app.use('*', methodGuard)
+
+app.get('/health', ...)
+app.get('/health/auth', auth, ...)
+
+app.use('/snip/*', auth)
+app.use('/stats', auth)
+app.use('/snip', contentTypeGuard)
+~~~
+
+请求体必须原样传给 R2。不能为了边读边计数而套一层普通 `TransformStream`，因为它会丢失 Workers 请求体携带的固定长度属性，R2 会以“stream must have a known length”拒绝写入。因此当前实现使用两级限制：
+
+1. `Content-Length` 存在时提前拒绝超限请求。
+2. R2 写入完成后按对象的实际 `size` 再校验；新建对象超限则删除，覆盖对象超限则恢复旧对象和全部 metadata。
 
 ### 4.3 错误码约定
 
 | HTTP 状态 | code 字符串 | 含义 |
 |-----------|------------|------|
-| 400 | `INVALID_INPUT` | 请求体校验失败 |
+| 400 | `INVALID_INPUT` | 请求头、路径参数或查询参数校验失败 |
 | 401 | `UNAUTHORIZED` | Token 缺失或无效 |
 | 404 | `NOT_FOUND` | 资源不存在 |
 | 405 | `METHOD_NOT_ALLOWED` | 不支持的 HTTP 方法 |
-| 409 | `KEY_CONFLICT` | key 已存在，需确认后使用 overwrite 参数 |
-| 413 | `PAYLOAD_TOO_LARGE` | 请求体超限 |
-| 415 | `UNSUPPORTED_MEDIA_TYPE` | Content-Type 不支持 |
+| 409 | `KEY_CONFLICT` | key 已存在，需显式允许覆盖 |
+| 413 | `PAYLOAD_TOO_LARGE` | `Content-Length` 或 R2 实际对象大小超限 |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | 缺少 `Content-Type` |
 | 500 | `INTERNAL_ERROR` | 服务内部错误 |
 
 伪装模式开启时，以上所有状态码对外均呈现为 `200 Hello World`，错误码仅出现在日志中。
@@ -110,666 +120,656 @@ app.use('/snip', contentTypeGuard)  // 6. 仅 POST 请求校验
 
 ## 5. API 接口
 
-所有客户端使用统一的 `/snip` 路径，不引入版本前缀。路由职责仅限于解析请求参数、调用服务层、返回响应，不包含任何业务逻辑。
+所有客户端使用统一的 `/snip` 路径，不引入版本前缀。路由负责解析并校验 HTTP 输入、构造 R2 metadata、调用服务层并映射响应，不承载 KV/R2 协调逻辑。
 
-**资源路由：**
+资源路由：
 
-```
+~~~
 GET    /health              健康检查，无需认证
-GET    /health/auth         带认证的握手检查，验证 Token 是否有效
-POST   /snip                创建 snip
-GET    /snip                列出所有 snip（返回元数据列表）
-GET    /snip/:key           读取单个 snip（元数据 + 负载内容）
-DELETE /snip/:key           删除 snip（同时删除 KV 条目和 R2 对象）
-GET    /stats               查询存储统计信息
-```
+GET    /health/auth         带认证的握手检查
+POST   /snip                创建或覆盖 snip
+GET    /snip                分页列出 snip 索引
+GET    /snip/:key           流式读取 R2 原始对象
+DELETE /snip/:key           删除 KV 索引和 R2 对象
+GET    /stats               查询存储统计
+~~~
 
-`GET /health` 无需认证，用于基础存活探测。`GET /health/auth` 要求携带 Bearer Token，前端可在初始化时调用此接口验证 Token 是否配置正确，响应 200 表示认证通过，401 表示 Token 无效。
+除 `GET /health` 外，上述 snip 与 stats 接口都要求 `Authorization: Bearer <token>`。`GET /health/auth` 用于客户端初始化时验证 Token。
 
-**API 边界 Schema 约定：**
+API 边界约定：
 
-- 所有来自客户端的动态输入都必须在路由层通过 Zod 校验，包括 JSON 请求体、路径参数和查询参数。
-- KV 中的 JSON 元数据属于持久化边界，读取并反序列化后必须通过 `SnipMetaSchema` 校验，禁止直接使用类型断言信任历史数据。
-- Worker 自己构造的响应不重复执行 Zod 运行时校验，改用 TypeScript DTO 类型和显式字段映射保证结构正确。
-- 路由不得直接将 `SnipMeta` 传给 `c.json()`，必须逐字段构造公开 DTO，避免泄漏 `r2Key` 等内部字段；对象字面量使用 `satisfies` 校验 DTO 类型。
-- 前端若需要防御网络响应与客户端版本不一致，应在前端边界校验响应，或后续通过共享契约生成客户端类型。
+- `POST /snip` 不解析 JSON；请求正文就是对象正文，控制参数和对象 metadata 全部来自请求头。
+- 所有动态请求头、路径参数和查询参数在路由边界用 Zod 校验。
+- KV JSON 属于持久化边界，反序列化后必须通过 `SnipMetaSchema`，禁止直接断言历史数据类型。
+- JSON 响应通过显式 DTO 映射构造，禁止把含内部 `r2Key` 的 `SnipMeta` 直接展开。
+- `GET /snip/:key` 是例外：它返回原始 R2 对象流和对象 HTTP metadata，不返回 JSON DTO。
 
-**`GET /stats` 响应示例：**
+`GET /stats` 响应：
 
-```json
+~~~json
 {
   "count": 42,
   "totalSize": 10485760,
   "storageLimit": 104857600
 }
-```
+~~~
 
-- `count`：当前存储的 snip 数量，通过 KV 维护独立计数器键实现 O(1) 查询
-- `totalSize`：所有 snip 负载的累计字节数，同样通过 KV 计数器维护
-- `storageLimit`：全局容量上限，由环境变量 `SNIPFLOW_TOTAL_STORAGE_LIMIT`（字节数）静态配置，不依赖 R2 存储桶 API
+- `count`：KV 计数器维护的 snip 数量。
+- `totalSize`：KV 计数器维护的正文总字节数。
+- `storageLimit`：`SNIPFLOW_TOTAL_STORAGE_LIMIT` 的静态配置值，不是从 R2 bucket 动态读取。
 
-### 5.1 POST /snip — 创建 snip
+### 5.1 POST /snip — 创建或覆盖 snip
 
-创建请求支持多种内容类型，通过 `type` 字段区分。**所有字段均为必填**，`key` 置空字符串 `""` 时由服务端生成随机 ID，`expiry.mode` 为 `"forever"` 表示永久保存。
+请求正文为待保存的原始字节，不再存在 `type`、`content` 或 `expiry` JSON 字段，也不区分 text、image、file 三种类别。
 
-**请求体：**
+~~~http
+POST /snip HTTP/1.1
+Authorization: Bearer <token>
+Content-Type: application/pdf
+Content-Language: zh-CN
+Content-Disposition: attachment; filename="report.pdf"
+Cache-Control: private, max-age=3600
+Expires: Tue, 08 Sep 2026 00:00:00 GMT
+X-Snip-Key: report-2026
+X-Snip-Source: page
+X-Snip-Filename: report.pdf
+X-Snip-TTL: 86400
+X-Snip-Overwrite: false
+X-Snip-Meta-Category: finance
 
-```json
-{
-  "key": "my-note",
-  "type": "text",
-  "content": "hello world",
-  "source": "page",
-  "expiry": {
-    "mode": "ttl",
-    "ttl": 86400
-  },
-  "overwrite": false
-}
-```
+<PDF 原始字节>
+~~~
 
-**字段说明：**
+控制头：
 
-| 字段 | 类型 | 说明 |
+| Header | 必填 | 校验与语义 |
 |------|------|------|
-| `key` | `string` | 用户自定义查询键，接收方凭此键精确取回内容。允许空字符串 `""`（由服务端生成随机 key）；非空时必须为 1–128 个 URL-safe 字符，仅允许字母、数字、`_`、`-` |
-| `type` | `string` | 内容类型，见下表，Zod `z.enum` 严格枚举校验 |
-| `content` | `string` | 实际内容，不得为空字符串 |
-| `source` | `string` | 来源标记（`page` / `bot-tg` 等），仅作元数据记录 |
-| `expiry` | `object` | 时效策略，见下表 |
-| `overwrite` | `boolean`（可选） | 默认 `false`。为 `true` 时强制覆盖已存在的 key，为 `false` 时 key 冲突返回 `409 KEY_CONFLICT` |
+| `Authorization` | 是 | Bearer Token；只用于认证，绝不写入 metadata |
+| `Content-Type` | 是 | 任意合法 MIME，可包含参数，例如 `text/markdown; charset=utf-8` |
+| `X-Snip-Key` | 否 | 缺省或空值时生成 5 位随机 key；自定义值为 1–128 个 `[A-Za-z0-9_-]` 字符 |
+| `X-Snip-Source` | 是 | 1–256 字符；仅作来源元数据，不参与授权 |
+| `X-Snip-Filename` | 否 | 解码后 1–1024 字符；浏览器发送非 ASCII 文件名时先用 `encodeURIComponent` |
+| `X-Snip-TTL` | 否 | 正整数秒；缺省表示永久可见 |
+| `X-Snip-Overwrite` | 否 | 只能是 `true` / `false`，默认 `false` |
+| `X-Snip-Meta-*` | 否 | 显式声明扩展 custom metadata；前缀后的名字作为 metadata key |
 
-**时效策略（`expiry` 字段）：**
+`X-Snip-Filename` 缺省时，Worker 依次尝试解析 `Content-Disposition` 的 `filename*=UTF-8''...`、引号形式 `filename="..."` 和普通 `filename=...`。
 
-| mode | 额外参数 | 实现方式 | 说明 |
-|------|---------|---------|------|
-| `"forever"` | — | KV 不设过期，R2 对象永久保留 | 由用户主动调用 DELETE 删除 |
-| `"ttl"` | `ttl`（秒，正整数） | KV `expirationTtl`，孤立 R2 对象由清理任务回收 | 到达指定秒数后自动过期 |
-| `"once"`（未来） | `count`（次数） | 读取时递减计数，归零后触发删除 | 取出 N 次后自动删除 |
+标准 HTTP metadata 映射：
 
-**R2 孤立对象清理方案：**
+| HTTP 请求头 | `R2HTTPMetadata` 字段 | 类型 |
+|------|------|------|
+| `Content-Type` | `contentType` | `string` |
+| `Content-Language` | `contentLanguage` | `string` |
+| `Content-Disposition` | `contentDisposition` | `string` |
+| `Content-Encoding` | `contentEncoding` | `string` |
+| `Cache-Control` | `cacheControl` | `string` |
+| `Expires` | `cacheExpiry` | `Date` |
 
-R2 不支持对单个对象设置过期时间，[生命周期规则](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)只能在 bucket 级别按前缀配置，无法精确匹配每个 snip 的独立 TTL。因此采用以下策略：
+`Expires` 在 Schema 边界解析成 `Date`。这些字段与 HTTP 标准头有直接映射，但 `Content-Type` 的值不是项目枚举：只要 MIME 语法合法即可。Worker 不猜测文件类型，也不根据后缀重写 Content-Type。
 
-KV 的 `expirationTtl` 控制元数据过期，元数据消失后该 snip 对外立即不可见。R2 侧的孤立对象（KV 已过期但 R2 对象仍存在）通过 **[Workers Cron Trigger](https://developers.cloudflare.com/workers/examples/cron-trigger/)** 定期清理：
+custom metadata 映射：
 
-```ts
-// wrangler.jsonc 中配置定时任务，每小时执行一次
-// "triggers": { "crons": ["0 * * * *"] }
+| 请求头 | R2 `customMetadata` |
+|------|------|
+| `X-Snip-Source: page` | `source: "page"` |
+| `X-Snip-Filename: report.pdf` | `filename: "report.pdf"` |
+| `X-Snip-Meta-Category: finance` | `category: "finance"` |
+| 其他 `X-Snip-Meta-*` | 前缀后的名称和值 |
 
-export default {
-  async scheduled(event, env, ctx) {
-    // 1. list 所有 R2 对象（前缀 snips/）
-    const listed = await env.SNIPFLOW_R2.list({ prefix: 'snips/' })
-    for (const obj of listed.objects) {
-      // 2. 从 R2 key 中提取 snip key（格式：snips/{key}/payload）
-      const snipKey = obj.key.split('/')[1]
-      // 3. 查询 KV，找不到元数据说明已过期或已被删除
-      const meta = await env.SNIPFLOW_KV.get(`snip:${snipKey}`)
-      if (!meta) {
-        await env.SNIPFLOW_R2.delete(obj.key)
-      }
-    }
-  }
-}
-```
+请求头名称由 Fetch API 规范化，因此扩展 metadata key 按小写保存。`source` 和 `filename` 是规范字段，优先于同名 `X-Snip-Meta-*`。custom metadata 的 key/value UTF-8 字节数合计不得超过 8192；路由在调用 R2 前完成校验。
 
-此方案完全在 Workers 平台内部运作，无需外部服务，清理粒度与 KV TTL 精确对应。
+仅保存六个标准 HTTP metadata 头、`source`、`filename` 和显式的 `X-Snip-Meta-*`。`Authorization`、`Cookie`、`Host`、`CF-*`、`Content-Length` 等认证或传输头不会被复制。
 
-**内容类型（`type` 字段）：**
+TTL 仍由 KV 控制：`X-Snip-TTL` 存在时传给 KV `expirationTtl`，缺省时不设置过期。R2 不按单条 snip 的 KV TTL 自动删除；每小时运行的 Cron Trigger 扫描 `snips/`，删除已没有 `snip:{key}` KV 索引的孤立对象。
 
-R2 可存储任意格式的数据（`put()` 接受 `string | ArrayBuffer | ReadableStream | Blob`），`type` 字段的作用是让客户端正确解释内容，而非限制 R2 的存储能力。按内容格式分类，大部分文本归入 `text`：
-
-| type | 适用内容 | R2 写入时的 contentType |
-|------|---------|----------------------|
-| `"text"` | 纯文本、Markdown、代码片段、URL、JSON 字符串等一切文本 | `text/plain` |
-| `"image"` | PNG、JPEG、WebP、GIF 等图片 | `image/png` 等 |
-| `"file"` | 二进制文件、文档等其他格式 | `application/octet-stream` |
-
-Zod 使用 `z.enum(["text", "image", "file"])` 做枚举校验，非法值返回明确错误信息。
-
-**Zod 校验方案：**
-
-使用以下 Zod 功能，均有[官方文档](https://zod.dev)依据：
+Schema 由 `CreateSnipHeadersSchema` 组成，主要使用：
 
 | Zod 功能 | 用途 |
-|---------|------|
-| `z.object({...})` | 定义请求体结构，所有字段默认必填 |
-| `z.string().min(1, "不得为空")` | 校验 `content`、`source` 等字符串字段非空 |
-| `z.union([z.literal(""), SnipKeySchema])` | 创建时允许空 key；非空 key 复用统一的 URL-safe key 规则 |
-| `z.enum([...])` | 校验 `type` 为枚举值，非法值自动报错 |
-| `z.discriminatedUnion("mode", [...])` | 按 `expiry.mode` 分支校验：`ttl` 模式必须包含正整数 `ttl`，`forever` 模式不得有多余字段 |
-| `z.number().int().positive()` | 校验 `ttl` 为正整数秒数 |
-| `.safeParse()` | 返回 `{ success, data, error }` 结构，校验失败时将 `error.issues` 格式化后以 `INVALID_INPUT` 错误码返回 400 |
+|------|------|
+| `z.strictObject({...})` | 明确定义路由构造的请求头输入 |
+| `z.union([z.literal(''), SnipKeySchema])` | 允许缺省 key，同时复用 URL-safe key 规则 |
+| `z.enum(['true', 'false']).transform(...)` | 校验并转换 overwrite |
+| `z.string().regex(...).transform(Number)` | 把 TTL 头转换成正整数秒 |
+| `.refine(...)` | 验证 MIME 与 HTTP 日期 |
+| `.safeParse()` | 把问题转换为 `400 INVALID_INPUT` 的 issues 列表 |
 
-**校验示例：**
+创建成功返回 JSON 索引信息：
 
-```ts
-const ExpirySchema = z.discriminatedUnion("mode", [
-  z.object({ mode: z.literal("forever") }),
-  z.object({ mode: z.literal("ttl"), ttl: z.number().int().positive() }),
-])
-
-const SnipKeySchema = z
-  .string()
-  .min(1)
-  .max(128)
-  .regex(/^[A-Za-z0-9_-]+$/)
-
-const CreateSnipSchema = z.object({
-  key: z.union([z.literal(""), SnipKeySchema]),
-  type: z.enum(["text", "image", "file"]),
-  content: z.string().min(1, { error: "content 不得为空" }),
-  source: z.string().min(1, { error: "source 不得为空" }),
-  expiry: ExpirySchema,
-})
-
-// 路由处理器中
-const result = CreateSnipSchema.safeParse(await c.req.json())
-if (!result.success) {
-  return c.json({
-    error: { code: "INVALID_INPUT", message: result.error.issues, requestId: c.get("requestId") }
-  }, 400)
-}
-```
-
-**响应体（201）：**
-
-```json
+~~~json
 {
-  "key": "my-note",
-  "type": "text",
+  "key": "report-2026",
+  "contentType": "application/pdf",
+  "filename": "report.pdf",
   "source": "page",
-  "size": 11,
-  "createdAt": "2026-07-09T00:00:00.000Z",
-  "expiresAt": "2026-07-10T00:00:00.000Z"
+  "size": 12345,
+  "createdAt": "2026-09-07T00:00:00.000Z",
+  "expiresAt": "2026-09-08T00:00:00.000Z"
 }
-```
+~~~
 
-`key` 字段始终在响应中返回，无论是用户提供的还是服务端生成的，接收方凭此 key 查询。
+`key` 始终返回；`filename` 可能为 `null`，永久对象的 `expiresAt` 为 `null`。
 
 ### 5.2 GET /snip/:key — 读取 snip
 
-响应体同时包含元数据和负载内容：
+响应直接流式返回 R2 原始正文，不再把内容放进 JSON：
 
-```json
-{
-  "key": "my-note",
-  "type": "text",
-  "source": "page",
-  "size": 11,
-  "createdAt": "2026-07-09T00:00:00.000Z",
-  "expiresAt": "2026-07-10T00:00:00.000Z",
-  "content": "hello world"
-}
-```
+~~~http
+GET /snip/report-2026 HTTP/1.1
+Authorization: Bearer <token>
+~~~
+
+Worker 对响应执行以下映射：
+
+1. 调用 `R2ObjectBody.writeHttpMetadata(headers)` 恢复六个标准 HTTP metadata。
+2. 写入 `ETag` 和 `Content-Length`。
+3. 若 R2 没有 Content-Type，则用 KV 的 `contentType` 兜底。
+4. 若有 `customMetadata.filename` 但没有 Content-Disposition，则生成 `attachment; filename*=UTF-8''...`。
+5. 以 `new Response(payload.body, { headers })` 返回，不缓冲对象。
+
+除 filename 的下载头用途外，其他 custom metadata 当前不暴露给下载响应；它们保留在 R2 对象上供后续能力使用。
 
 ### 5.3 GET /snip — 列出所有 snip
 
-返回元数据列表，不包含 `content` 字段，支持分页：
+列表只读取 KV 索引，不加载 R2 正文。查询参数 `cursor` 可选，必须是上一页返回的非空不透明字符串；每页最多 100 条。
 
-查询参数：`cursor` 可选，值为上一次响应返回的非空不透明字符串；每页固定最多返回 100 条，不对外开放 `limit` 参数。
-
-```json
+~~~json
 {
   "items": [
     {
-      "key": "my-note",
-      "type": "text",
-      "size": 11,
-      "createdAt": "2026-07-09T00:00:00.000Z",
-      "expiresAt": "2026-07-10T00:00:00.000Z"
+      "key": "report-2026",
+      "contentType": "application/pdf",
+      "filename": "report.pdf",
+      "size": 12345,
+      "createdAt": "2026-09-07T00:00:00.000Z",
+      "expiresAt": "2026-09-08T00:00:00.000Z"
     }
   ],
   "cursor": "next-page-cursor"
 }
-```
+~~~
+
+列表项不含正文、`source`、custom metadata 或内部 `r2Key`。
 
 ### 5.4 输入 Schema 与响应 DTO 映射
 
-| 接口 | 运行时输入 Schema | TypeScript 响应 DTO |
-|------|-------------------|---------------------|
-| `POST /snip` | `CreateSnipSchema` | `CreateSnipResponse` |
-| `GET /snip` | `ListSnipsQuerySchema` | `ListSnipsResponse` |
-| `GET /snip/:key` | `SnipKeyParamsSchema` | `ReadSnipResponse` |
-| `DELETE /snip/:key` | `SnipKeyParamsSchema` | 无（204） |
-| `GET /stats` | 无动态输入 | `Stats` |
+| 接口 | 运行时输入 Schema | 输出 |
+|------|-------------------|------|
+| `POST /snip` | `CreateSnipHeadersSchema` | `CreateSnipResponse` JSON |
+| `GET /snip` | `ListSnipsQuerySchema` | `ListSnipsResponse` JSON |
+| `GET /snip/:key` | `SnipKeyParamsSchema` | 原始 `Response` 流 |
+| `DELETE /snip/:key` | `SnipKeyParamsSchema` | 204，无正文 |
+| `GET /stats` | 无动态输入 | `Stats` JSON |
 
-运行时 Schema 组成约定：
+运行时 Schema：
 
-- `SnipKeySchema`：1–128 个 URL-safe 字符，仅允许 `[A-Za-z0-9_-]`。该限制同时避免 R2 对象路径与 cleanup 提取逻辑产生歧义。
-- `SnipKeyParamsSchema`：`{ key: SnipKeySchema }`，用于读取和删除路由。
-- `ListSnipsQuerySchema`：`{ cursor?: string }`，cursor 存在时不得为空；未知查询字段拒绝处理。
-- `SnipMetaSchema`：KV 内部元数据结构，包含 `r2Key`，只用于存储边界，不直接作为 HTTP 响应。
+- `SnipKeySchema`：1–128 个 URL-safe 字符，只允许 `[A-Za-z0-9_-]`。
+- `SnipKeyParamsSchema`：读取和删除路由的 `{ key }`。
+- `ListSnipsQuerySchema`：`{ cursor?: string }`，拒绝空 cursor 和未知字段。
+- `CreateSnipHeadersSchema`：创建控制头和六个 R2 HTTP metadata 字段。
+- `SnipMetaSchema`：KV 内部持久化结构，只用于仓储边界。
 
-响应 DTO 组成约定：
+响应 DTO：
 
-- `CreateSnipResponse`：创建成功后的公开元数据，不包含 `r2Key`。
-- `ReadSnipResponse`：公开元数据加 `content`，不包含 `r2Key`。
-- `ListSnipItem`：列表项字段（`key`、`type`、`size`、`createdAt`、`expiresAt`），不包含 `content`、`source`、`r2Key`。
-- `ListSnipsResponse`：`{ items: ListSnipItem[], cursor?: string }`。
-- `Stats`：`{ count, totalSize, storageLimit }`，三个字段均为非负整数。
+- `CreateSnipResponse`：`key`、`contentType`、`filename`、`source`、`size`、`createdAt`、`expiresAt`。
+- `ListSnipItem`：不含 `source`，其余为 `key`、`contentType`、`filename`、`size`、`createdAt`、`expiresAt`。
+- `ListSnipsResponse`：`{ items, cursor? }`。
+- `Stats`：`{ count, totalSize, storageLimit }`。
 
-以上 DTO 定义在 `domain/types.ts`。路由通过显式 mapper 或逐字段对象字面量构造 DTO，不允许使用 `{ ...meta }` 展开内部 metadata。
+以上类型定义在 `domain/types.ts`。
 
 ## 7. 存储模型
 
-元数据与负载分开存储，分别使用 Cloudflare KV 和 R2，以保持列表查询的高效性，同时支持后续添加大文件或二进制负载。
+索引与负载分开存储：KV 支持分页列表、TTL 可见性和统计；R2 保存任意字节正文、HTTP metadata 与 custom metadata。正文格式不再被压扁为项目内的三种类型。
 
-### 7.1 KV 存储（元数据）
+### 7.1 KV 存储（索引元数据）
 
-每个 snip 在 KV 中对应一条记录，KV key 为 `snip:{key}`，value 为 JSON 字符串：
+每个 snip 对应 `snip:{key}`，value 为 JSON。TTL 对象写入时附带 `expirationTtl`：
 
-**KV 写入：**
-```ts
+~~~ts
 await env.SNIPFLOW_KV.put(
   `snip:${key}`,
   JSON.stringify(metadata),
-  { expirationTtl: ttlSeconds }   // 可选，永久保存时不传
+  ttlSeconds ? { expirationTtl: ttlSeconds } : undefined
 )
-```
+~~~
 
-**KV 读取：**
-```ts
+读取时必须处理非法 JSON 和不符合当前 Schema 的历史数据：
+
+~~~ts
 const raw = await env.SNIPFLOW_KV.get(`snip:${key}`)
 if (!raw) return null
 
-const result = SnipMetaSchema.safeParse(JSON.parse(raw))
-if (!result.success) {
-  throw new InternalError('Invalid snip metadata in KV')
-}
+const parsed: unknown = JSON.parse(raw)
+const result = SnipMetaSchema.safeParse(parsed)
+if (!result.success) throw new InternalError('Invalid snip metadata in KV')
 return result.data
-```
+~~~
 
-KV 的值可能来自旧版本、人工写入或损坏数据，因此 `JSON.parse(raw) as SnipMeta` 不构成有效校验。JSON 解析失败或 `SnipMetaSchema` 校验失败都按内部存储错误处理，不向客户端暴露具体数据内容。
+列表与删除：
 
-**KV 列表（分页）：**
-```ts
-const list = await env.SNIPFLOW_KV.list({ prefix: 'snip:', limit: 100, cursor })
-```
-
-**KV 删除：**
-```ts
+~~~ts
+await env.SNIPFLOW_KV.list({ prefix: 'snip:', limit: 100, cursor })
 await env.SNIPFLOW_KV.delete(`snip:${key}`)
-```
+~~~
 
-**KV 计数器（维护 stats）：**
-```
-// 创建时递增
-await env.SNIPFLOW_KV.put('meta:count', String(count + 1))
-await env.SNIPFLOW_KV.put('meta:totalSize', String(totalSize + size))
+统计计数器使用 `meta:count` 和 `meta:totalSize`。创建、覆盖和删除按对象实际 R2 size 计算增量。
 
-// 删除时递减
-await env.SNIPFLOW_KV.put('meta:count', String(count - 1))
-await env.SNIPFLOW_KV.put('meta:totalSize', String(totalSize - size))
-```
+KV 中的结构：
 
-**KV 中存储的元数据结构：**
-
-```json
+~~~json
 {
-  "key": "my-note",
-  "type": "text",
+  "key": "report-2026",
+  "contentType": "application/pdf",
+  "filename": "report.pdf",
   "source": "page",
-  "size": 11,
-  "createdAt": "2026-07-09T00:00:00.000Z",
-  "expiresAt": "2026-07-10T00:00:00.000Z",
-  "r2Key": "snips/my-note/payload"
+  "size": 12345,
+  "createdAt": "2026-09-07T00:00:00.000Z",
+  "expiresAt": null,
+  "r2Key": "snips/report-2026/payload"
 }
-```
+~~~
 
-`r2Key` 字段记录对应的 R2 对象路径，用于读取和删除负载时定位。
+`r2Key` 是内部定位字段，不进入公开 JSON。R2 的正文与对象 metadata 是事实来源；KV 只保留列表和业务判断需要的冗余字段。
 
-### 7.2 R2 存储（负载内容）
+### 7.2 R2 存储（正文和对象 metadata）
 
-每个 snip 的实际内容存储为一个 R2 对象，key 为 `snips/{key}/payload`。
+对象 key 保持为 `snips/{key}/payload`。仓储方法接受 R2 支持的通用正文类型：
 
-**R2 写入：**
-```ts
+~~~ts
+export type SnipPayload =
+  | ReadableStream
+  | ArrayBuffer
+  | ArrayBufferView
+  | string
+  | null
+  | Blob
+
 await env.SNIPFLOW_R2.put(
   `snips/${key}/payload`,
-  content,
-  { httpMetadata: { contentType: mime } }
+  payload,
+  {
+    httpMetadata,
+    customMetadata,
+    storageClass,
+  }
 )
-```
+~~~
 
-**R2 读取：**
-```ts
-const obj = await env.SNIPFLOW_R2.get(`snips/${key}/payload`)
-const content = await obj.text()   // 或 .arrayBuffer() / .stream()
-```
+当前 HTTP 路由把 `Request.body` 直接传给 `put`。仓储同时保留 `storageClass` 参数，供覆盖回滚时原样恢复；校验和、条件写入、SSE-C 等其他 `R2PutOptions` 尚未开放为公共 API。
 
-**R2 删除：**
-```ts
-await env.SNIPFLOW_R2.delete(`snips/${key}/payload`)
-```
+读取必须保留流和 metadata：
 
-### 7.3 创建 / 删除的原子性保证
+~~~ts
+const object = await env.SNIPFLOW_R2.get(`snips/${key}/payload`)
+if (!object) throw new NotFoundError()
+return new Response(object.body, { headers })
+~~~
 
-KV 和 R2 不支持事务，通过以下顺序降低不一致风险：
+禁止在通用读取路径调用 `text()` 或 `arrayBuffer()` 缓冲整个对象。返回响应前使用 `writeHttpMetadata` 恢复标准头，并单独写入 `httpEtag` 与对象大小。
 
-- **创建**：先写 R2，再写 KV。若 KV 写入失败，孤立的 R2 对象可通过定期清理任务回收。
-- **删除**：先删 KV，再删 R2。若 R2 删除失败，KV 已不存在该记录，R2 对象变为不可达孤立对象，同样由清理任务处理。
+### 7.3 创建、覆盖与删除的一致性
+
+KV 和 R2 没有跨产品事务，服务层通过写入顺序和补偿回滚降低不一致风险。
+
+创建或覆盖：
+
+1. 解析 key，读取旧 KV 元数据。
+2. 覆盖时读取旧 `R2ObjectBody`，保留正文流、`httpMetadata`、`customMetadata` 和 `storageClass`。
+3. 写新 R2 对象。
+4. 按 R2 返回的实际 `size` 校验上限。
+5. 写 KV 索引及 TTL。
+6. 按新旧 size 差值更新计数器。
+
+第 3–5 步失败时：
+
+- 新建对象：删除已写入的 R2 对象。
+- 覆盖对象：用旧正文和全部对象 metadata 恢复原对象。
+- 回滚本身失败：抛出同时包含原始错误与回滚错误的 `AggregateError`。
+
+删除顺序保持“先 KV、后 R2”。如果 R2 删除失败，对象已不可通过 API 到达，后续由 Cron 清理。KV 先到期形成的孤立 R2 对象也走同一清理链路。
 
 ## 8. 内部分层
 
-关于环境变量类型：所有环境变量（`SNIPFLOW_API_TOKEN`、`SNIPFLOW_TOTAL_STORAGE_LIMIT`、`SNIPFLOW_MAX_SNIP_SIZE`、`SNIPFLOW_DISGUISE`）和 binding（KV、R2）均在 `wrangler.jsonc` 的 `vars` / `kv_namespaces` / `r2_buckets` 中声明，随服务一起部署。运行 `wrangler types` 会自动生成 `worker-configuration.d.ts`，其中包含完整的 `Env` 类型，代码中直接引用该类型，不需要额外的 `env.ts`。
+所有环境变量和 binding 在 `wrangler.jsonc` 中声明，`wrangler types --env-interface CloudflareBindings` 生成 `worker-configuration.d.ts`。仓库提供 `wrangler.jsonc.example`；实际 `wrangler.jsonc`、生成类型和本地密钥文件不提交版本库。
 
-**目录结构：**
+目录结构：
 
-```
+~~~
 src/
-  index.ts                  Worker 入口：注册 fetch handler 和 scheduled handler
-  app.ts                    构建 Hono app，挂载中间件和路由
+  index.ts                  Worker fetch / scheduled 入口
+  app.ts                    Hono app、中间件与路由注册
 
   routes/
-    health.ts               GET /health 和 GET /health/auth
-    snip.ts                 POST/GET /snip 和 GET/DELETE /snip/:key
+    snip.ts                 请求头映射、原始 body 传递、下载响应
     stats.ts                GET /stats
 
   middleware/
-    request-id.ts           挂载 hono/request-id（Request ID 注入）
-    guard.ts                方法白名单过滤（GET/POST/DELETE）、请求体大小限制 100 MB（hono/body-limit）
-    auth.ts                 Bearer Token 校验（hono/bearer-auth），通过回调抛出 UnauthorizedError
-    content-type.ts         POST 写请求的 Content-Type 校验
+    request-id.ts           Request ID 注入
+    guard.ts                方法白名单、Content-Length 预检、大小配置校验
+    auth.ts                 Bearer Token 认证
+    content-type.ts         写请求必须声明 Content-Type
 
   schemas/
-    snip.ts                 key/params/query、创建请求体 Schema（Zod）
+    snip.ts                 创建头、key、path params、list query Schema
 
   services/
     snip/
-      create.ts             创建 snip 业务逻辑
-      list.ts               列出 snip 业务逻辑
-      read.ts               读取单个 snip 业务逻辑
-      delete.ts             删除 snip 业务逻辑
-    stats.ts                存储统计业务逻辑
+      create.ts             冲突、R2/KV 写入、实际大小校验、补偿回滚
+      list.ts               KV 分页列表
+      read.ts               联合读取 KV 与 R2ObjectBody
+      delete.ts             删除与计数器更新
+    stats.ts                存储统计
 
   repositories/
-    kv.ts                   KV 读写封装及 KV metadata 反序列化校验（put / get / list / delete / counter）
-    r2.ts                   R2 读写封装（put / get / delete / list）
+    kv.ts                   KV CRUD、分页、计数器、持久化 Schema 边界
+    r2.ts                   通用字节正文和对象 metadata 的 CRUD / list
 
   domain/
-    types.ts                SnipMeta、CreateSnipInput、公开响应 DTO 等核心类型
-    errors.ts               AppError 基类及各子类（NotFoundError、UnauthorizedError 等）
+    types.ts                Payload、SnipMeta、服务输入和公开 DTO
+    errors.ts               AppError 体系和统一错误响应
 
   utils/
-    key.ts                  snip key 随机生成（nanoid）
-    time.ts                 时间工具（ISO 格式化、TTL 转时间戳）
+    key.ts                  nanoid 随机 key
+    time.ts                 TTL 与 ISO 时间
+    r2-metadata.ts          文件名、custom metadata 白名单与下载头
 
   jobs/
-    cleanup.ts              Cron Trigger 清理任务：扫描 R2 孤立对象
-```
+    cleanup.ts              分页清理 R2 孤立对象
+~~~
 
-**为什么 services 按操作拆分文件：** snip 的增删查彼此独立，依赖的仓储方法不同，拆分后每个文件职责单一、测试隔离，不会出现一个需要通读全文才能定位逻辑的大文件。
+为什么 services 按操作拆分文件：snip 的增删查彼此独立，依赖的仓储方法不同，拆分后每个文件职责单一，测试可以直接调用服务而不构造 Hono Context。
 
-**各层职责：**
+各层职责：
 
 | 层级 | 职责 |
 |------|------|
-| routes | 解析并校验动态输入，调用服务层，通过显式字段映射构造类型化 HTTP 响应 |
-| middleware | 处理跨请求的横切行为（Request ID、守卫、认证、Content-Type） |
-| schemas | 用 Zod 定义并校验客户端的动态请求输入 |
-| services | 承载业务逻辑，协调 KV 与 R2 的读写顺序，处理计数器更新 |
-| repositories | 封装对 KV 和 R2 的原始 API 调用，在存储边界校验反序列化数据，返回类型化结果 |
-| domain | 定义跨层共享的稳定领域类型、响应 DTO 和错误基类 |
-| utils | 仅包含无副作用的小型工具函数 |
-| jobs | Cron Trigger 定时任务（R2 孤立对象清理） |
+| routes | 校验 HTTP 边界，映射 R2 metadata，传递原始流，构造公开响应 |
+| middleware | Request ID、认证、方法、Content-Type 和大小预检 |
+| schemas | 用 Zod 校验所有外部动态字符串以及 KV 持久化数据 |
+| services | 业务规则和 KV/R2 协调，不依赖 Hono |
+| repositories | 封装绑定 API，保留 R2 流和对象 metadata |
+| domain | 稳定领域输入、持久化类型、公开 DTO 和错误 |
+| utils | 无副作用的 key、时间和 metadata 工具 |
+| jobs | Scheduled handler 调用的孤立对象清理 |
 
 ## 9. 解耦原则
 
-- 路由处理器不直接调用 KV 或 R2，只通过服务层操作
-- 服务层不依赖 Hono context，只接收纯参数，便于单元测试
-- 仓储层不感知请求来源，只负责 KV / R2 的读写
-- `source` 是元数据，不作为权限边界
-- 新增内容类型在 schemas / services 层扩展，不引入新的顶层存储概念
-- 新客户端复用 `/snip`，不引入客户端专属路由
+- 路由处理器不直接访问 KV 或 R2，只通过服务层操作。
+- 服务层不依赖 Hono Context，只接收 binding 与领域输入。
+- 仓储层不感知请求来源或 MIME，只负责 KV / R2 的通用读写。
+- `source` 是 metadata，不作为权限边界。
+- 内容类型由标准 `Content-Type` 表达；新增 MIME 无需修改 Schema 枚举或服务映射。
+- 只有显式 `X-Snip-Meta-*` 才进入扩展 custom metadata，避免保存敏感或无关请求头。
+- 新客户端复用 `/snip`，不引入客户端专属路由。
+- 大对象读写保持流式，不在 route/service/repository 任一层转成完整字符串或缓冲区。
 
 ## 10. 测试策略
 
-使用 Vitest + `@cloudflare/vitest-pool-workers`，在真实 Workers 运行时中执行测试，不使用 mock，确保 KV / R2 行为与生产一致。
+使用 Vitest + `@cloudflare/vitest-pool-workers`，在 Workers 运行时和真实 KV/R2 测试 binding 中执行，不用手写存储 mock。
 
-**测试分层：**
+测试分层：
 
-| 层级 | 测试类型 | 覆盖目标 |
-|------|---------|---------|
-| repositories | 单元测试 | KV key 格式、R2 对象路径、计数器读写、空值处理 |
-| schemas | 单元测试 | 合法/非法输入的 safeParse 结果，每个字段的边界值 |
-| services | 单元测试 | 业务分支（TTL/forever、key 为空时生成 ID、delete 后计数递减） |
-| routes | 集成测试 | 完整 HTTP 请求/响应周期，包含中间件链 |
-| jobs | 集成测试 | cleanup 扫描逻辑：有 KV 对应的 R2 对象不删，无 KV 的删除 |
+| 层级 | 覆盖目标 |
+|------|------|
+| repositories | KV Schema 边界、对象路径、任意字节、完整 R2 metadata、分页和空值 |
+| schemas | header、MIME、TTL、overwrite、HTTP 日期、key 与 cursor 边界 |
+| utils | 文件名解析、UTF-8 编码、metadata 白名单与 8192 字节计算 |
+| services | 生成 key、冲突、覆盖、TTL、实际大小、计数器与补偿回滚 |
+| routes | 原始 HTTP body、标准/自定义 metadata、流式下载、错误与完整生命周期 |
+| jobs | 分页扫描，只删除没有 KV 索引的 `snips/` 对象 |
 
-**关键测试用例（按层）：**
+关键用例：
 
 _repositories/kv_
-- `putSnip` 写入后 `getSnip` 能取到相同内容
-- `putSnip` 带 `expirationTtl` 写入后 key 存在于 KV
-- `deleteSnip` 后 `getSnip` 返回 null
-- `listSnips` 返回 `snip:` 前缀的所有 key
-- KV 中存在非法 JSON 或不符合 `SnipMetaSchema` 的 metadata 时，`getSnip` 抛出内部错误而不是返回伪造类型
+
+- 合法 `SnipMeta` 往返一致。
+- 非法 JSON、旧 `type` 结构或缺失 `contentType` 的数据抛出 `InternalError`。
+- TTL、删除、分页和计数器行为正确。
 
 _repositories/r2_
-- `putPayload` 写入后 `getPayload` 返回相同内容
-- `deletePayload` 后 `getPayload` 返回 null
-- `listPayloads` 返回 `snips/` 前缀的所有对象
 
-_schemas/snip_
-- `CreateSnipSchema.safeParse` 对合法输入返回 `success: true`
-- `type` 传入 `"link"` 返回失败，错误指向 `type` 字段
-- `content` 为空字符串返回失败
-- `content` 的 UTF-8 字节数超过 `SNIPFLOW_MAX_SNIP_SIZE` 返回失败，错误指向 `content` 字段
-- `expiry.mode = "ttl"` 且缺少 `ttl` 字段返回失败
-- `expiry.mode = "forever"` 且附带 `ttl` 字段应被忽略或返回失败
-- 创建请求的 `key = ""` 合法；非空 key 包含 `/`、空格或超过 128 字符时返回失败
-- `SnipKeyParamsSchema` 拒绝空 key 和非 URL-safe key
-- `ListSnipsQuerySchema` 接受缺省或非空 cursor，拒绝空 cursor 和未知字段
+- 字符串与二进制逐字节往返。
+- `httpMetadata` 与 `customMetadata` 可写入并读取。
+- delete 后返回 null；list 只返回 `snips/` 前缀。
+
+_schemas 与 utils_
+
+- 接受标准和 vendor MIME，拒绝缺少斜线等非法值。
+- 接受缺省 key，拒绝带斜线、空格或超过 128 字符的 key。
+- TTL 只接受正整数字符串；overwrite 只接受 true/false。
+- `Expires` 转成 Date，非法日期失败。
+- 从 `X-Snip-Filename` 与三种 Content-Disposition filename 形式提取名称。
+- UTF-8 custom metadata 按字节计数。
+- Authorization、Cookie、Host、CF-* 不进入 custom metadata。
 
 _services/snip/create_
-- `key` 为 `""` 时响应中 key 为随机生成的非空字符串
-- `key` 为 `"abc"` 时响应中 key 为 `"abc"`
-- 创建后 stats `count` 递增 1，`totalSize` 递增对应字节数
-- `mode = "ttl"` 创建后 KV 条目携带过期时间
 
-_services/snip/delete_
-- delete 后 `getSnip` 返回 404
-- delete 后 stats `count` 递减 1
+- 缺省 key 生成非空且不冲突的随机值，最多尝试 3 次。
+- 已存在 key 且 overwrite=false 返回 `KeyConflictError`。
+- 任意 payload 和完整 metadata 被原样传给 R2。
+- 以 R2 实际 size 写 KV 与 stats。
+- 超限新建删除 R2；超限覆盖恢复旧正文、HTTP metadata、custom metadata 与 storageClass。
+- TTL 对象写入 expiresAt 与 KV expirationTtl。
 
-_routes（集成）_
-- `GET /health` 无 Token 返回 200
-- `GET /health/auth` 无 Token 返回 401
-- `GET /health/auth` 携带正确 Token 返回 200
-- `POST /snip` 缺少 `content` 字段返回 400，body 包含 `INVALID_INPUT`
-- `POST /snip` → `GET /snip/:key` → `DELETE /snip/:key` 完整生命周期
-- 创建与读取响应不包含内部字段 `r2Key`
-- 列表响应不包含 `content`、`source`、`r2Key`
-- 伪装模式开启时，401 场景改为返回 200 `<h1>Hello World</h1>`
+_routes_
+
+- Content-Type 可为 `text/markdown`、`application/pdf` 或 vendor MIME。
+- 原始二进制 `POST` → `GET` 后字节完全一致。
+- 六个标准 metadata 头写入 R2并在下载时恢复。
+- filename 在缺少 Content-Disposition 时生成 RFC 5987 下载头。
+- custom metadata 仅接收 `X-Snip-Meta-*`。
+- 列表不返回正文、source、custom metadata 或 `r2Key`。
+- 401、400、409、413、415、404 与伪装模式行为正确。
 
 _jobs/cleanup_
-- R2 有对象、KV 有对应 metadata：不删除
-- R2 有对象、KV 无对应 metadata：删除
+
+- R2 有对象且 KV 有索引：保留。
+- R2 有对象但 KV 无索引：删除。
+- 不属于 `snips/` 前缀的 R2 对象不处理。
 
 ## 11. Roadmap
 
-从最外层开始，由外至内逐层推进，每个阶段完成后均可独立运行并以测试验证。
+以下步骤以空目录为起点，按顺序可以复刻当前项目。每个阶段都给出可独立验证的验收点；实现细节以本文件前述类型、Schema、存储顺序和 API 契约为准。
 
 ---
 
 ### 阶段一：项目骨架与最小可跑通状态
 
-**目标：** Worker 可以启动并响应 `/health`，所有基础配置就位。
+目标：Worker 可以启动并响应 `/health`，本地工具链和 Cloudflare binding 类型就位。
 
 实现步骤：
-1. 配置 `wrangler.jsonc`：dev port 10001、ip 0.0.0.0，添加 `vars` 占位符（`SNIPFLOW_API_TOKEN`、`SNIPFLOW_TOTAL_STORAGE_LIMIT`、`SNIPFLOW_MAX_SNIP_SIZE`、`SNIPFLOW_DISGUISE`）
-2. 运行 `wrangler types` 生成 `worker-configuration.d.ts`
-3. 编写 `src/index.ts`：导出 `default { fetch }` 交给 Hono app
-4. 编写 `src/app.ts`：创建 Hono app，挂载 `GET /health` 返回 `{ ok: true }`
 
-验收测试：
-```
-GET /health → 200 { ok: true }
-PUT /health → 405（任意不支持方法）
-```
+1. 初始化 ESM TypeScript 项目，使用 pnpm；安装运行依赖 `hono`、`nanoid`、`zod`，开发依赖 `wrangler`、`typescript-eslint`、`vitest`、`@cloudflare/vitest-pool-workers`、`@cloudflare/workers-types` 和 `@vitest/coverage-v8`。
+2. 添加与当前仓库一致的 scripts：`dev`、`deploy`、`cf-typegen`、`lint`、`test`、`test:watch`、`test:coverage`。
+3. 创建严格模式 `tsconfig.json`、ESLint 配置和 `vitest.config.ts`；Vitest 指向 `./wrangler.jsonc`。
+4. 创建 `wrangler.jsonc.example`，声明 `main: "src/index.ts"`、`SNIPFLOW_KV`、`SNIPFLOW_R2`、每小时 Cron，以及四个变量：
+   - `SNIPFLOW_API_TOKEN`
+   - `SNIPFLOW_TOTAL_STORAGE_LIMIT`
+   - `SNIPFLOW_MAX_SNIP_SIZE`
+   - `SNIPFLOW_DISGUISE`
+5. 复制为不提交的 `wrangler.jsonc`，填入 KV namespace ID、R2 bucket 名称和本地 Token，并在本地工作配置的 `dev` 中设置端口 10001、IP `0.0.0.0`；运行 `pnpm cf-typegen` 生成 `CloudflareBindings`。
+6. 编写 `src/index.ts` 导出 Hono fetch handler，编写 `src/app.ts` 注册 `GET /health` 返回 `{ "ok": true }`。
+
+验收：
+
+~~~
+pnpm exec tsc --noEmit
+pnpm dev
+GET /health -> 200 {"ok":true}
+~~~
 
 ---
 
-### 阶段二：中间件层
+### 阶段二：错误与中间件层
 
-**目标：** 所有请求在到达路由前经过完整的守卫链，错误响应格式统一。
+目标：所有请求在路由前经过一致的守卫，错误结构统一。
 
 实现步骤：
-5. 编写 `src/domain/errors.ts`：`AppError` 及子类，`handleError` 全局错误处理函数（含伪装模式逻辑）
-6. 编写 `src/middleware/request-id.ts`：挂载 `hono/request-id`
-7. 编写 `src/middleware/guard.ts`：方法白名单 + `hono/body-limit`（100 MB 硬编码）
-8. 编写 `src/middleware/content-type.ts`：POST 请求校验 `application/json`
-9. 编写 `src/middleware/auth.ts`：`hono/bearer-auth`，通过 `invalidToken` / `noAuthenticationHeader` 回调抛出 `UnauthorizedError`
-10. 添加 `GET /health/auth` 路由（复用 auth 中间件，返回 `{ ok: true, authed: true }`）
-11. 在 `app.ts` 中注册 `app.onError(handleError)` 并按序挂载所有中间件
 
-验收测试：
-```
-GET  /health           无 Token → 200 { ok: true }
-GET  /health/auth      无 Token → 401 UNAUTHORIZED（或伪装模式 200 Hello World）
-GET  /health/auth      正确 Token → 200 { ok: true, authed: true }
-POST /snip             Content-Type: text/plain → 415
-POST /snip（正确头）    body > 100MB → 413
-所有响应               包含 X-Request-Id 响应头
-```
+7. 在 `domain/errors.ts` 建立 `AppError`、401/404/400/405/409/413/415/500 子类和 `handleError`，实现伪装模式。
+8. 在 `middleware/request-id.ts` 挂载 `hono/request-id`。
+9. 在 `middleware/guard.ts` 实现 GET/POST/DELETE 白名单、`SNIPFLOW_MAX_SNIP_SIZE` 正整数配置校验，以及 POST 的 `Content-Length` 预检。
+10. 在 `middleware/content-type.ts` 要求 POST/PUT 存在 Content-Type，不限定 MIME。
+11. 在 `middleware/auth.ts` 使用 `hono/bearer-auth` 校验 `SNIPFLOW_API_TOKEN`。
+12. 添加 `GET /health/auth`，并严格按 4.2 节顺序挂载中间件。
+
+验收：
+
+~~~
+GET  /health           无 Token -> 200
+GET  /health/auth      无 Token -> 401
+GET  /health/auth      正确 Token -> 200
+POST /snip             无 Content-Type -> 415
+POST /snip             Content-Length 超配置 -> 413
+PUT  /health           -> 405
+所有响应包含 X-Request-Id
+~~~
 
 ---
 
-### 阶段三：领域类型与基础设施层
+### 阶段三：领域类型、工具与仓储层
 
-**目标：** 建立类型基础，封装底层存储访问，不包含任何业务逻辑。
+目标：建立类型和底层存储边界，不加入 Hono 业务逻辑。
 
 实现步骤：
-12. 编写 `src/domain/types.ts`：`SnipMeta`、`CreateSnipInput`、`SnipExpiry`，以及 `CreateSnipResponse`、`ReadSnipResponse`、`ListSnipItem`、`ListSnipsResponse`、`Stats` 响应 DTO
-13. 编写 `src/utils/key.ts`：`generateKey()` 基于 nanoid，生成随机 snip 标识符
-14. 编写 `src/utils/time.ts`：`ttlToExpiresAt(ttl)`、ISO 格式化
-15. 编写 `src/repositories/kv.ts`：`getSnip`、`putSnip`、`deleteSnip`、`listSnips`、`getCounter`、`setCounter`；在仓储内部使用 `SnipMetaSchema` 校验 KV 反序列化结果，禁止 `JSON.parse(...) as SnipMeta`
-16. 编写 `src/repositories/r2.ts`：`putPayload`、`getPayload`、`deletePayload`、`listPayloads`
 
-验收测试（单元）：
-```
-kv.putSnip → kv.getSnip 返回相同内容
-kv.deleteSnip → kv.getSnip 返回 null
-KV metadata 为非法 JSON 或结构不合法 → kv.getSnip 抛出 InternalError
-r2.putPayload → r2.getPayload 返回相同内容
-r2.deletePayload → r2.getPayload 返回 null
-kv.listSnips 只返回 snip: 前缀的 key
-r2.listPayloads 只返回 snips/ 前缀的对象
-```
+13. 在 `domain/types.ts` 定义 `SnipExpiry`、`SnipPayload`、`CreateSnipInput`、`SnipMeta`、`CreateSnipResponse`、`ListSnipItem`、`ListSnipsResponse` 和 `Stats`。
+14. 在 `utils/key.ts` 用 nanoid 的 62 字符字母表生成 5 位 key；在 `utils/time.ts` 实现当前时间和 TTL 到 ISO 时间转换。
+15. 新建 `utils/r2-metadata.ts`：解析 X-Snip-Filename、解析 Content-Disposition、从 `X-Snip-Meta-*` 构造白名单 custom metadata、按 UTF-8 统计大小、生成 RFC 5987 Content-Disposition。
+16. 在 `repositories/kv.ts` 实现 `getSnip`、`keyExists`、`putSnip`、`deleteSnip`、`listSnips` 和计数器；所有 JSON 读取通过 `SnipMetaSchema`。
+17. 在 `repositories/r2.ts` 实现 `putPayload`、`getPayload`、`deletePayload`、`listPayloads`。put 接收通用 `SnipPayload` 和 `httpMetadata/customMetadata/storageClass`，get 返回 `R2ObjectBody`，不得调用 `text()`。
+
+验收：
+
+~~~
+KV metadata 合法 -> 完整往返
+KV metadata 非法 -> InternalError
+R2 二进制 + HTTP/custom metadata -> 完整往返
+R2 get -> 保留 ReadableStream
+KV/R2 list -> 只返回各自约定前缀
+~~~
 
 ---
 
 ### 阶段四：Schema 校验层
 
-**目标：** 所有动态 HTTP 请求输入在进入业务逻辑前完成结构与取值约束校验，非法数据有准确字段指向。
+目标：所有 HTTP 动态输入在进入服务前完成校验。
 
 实现步骤：
-17. 编写 `src/schemas/snip.ts`：`SnipKeySchema`、`SnipKeyParamsSchema`、`ListSnipsQuerySchema`、`ExpirySchema`（discriminatedUnion）
-18. 编写 `CreateSnipSchema`：包含 UTF-8 content 字节大小校验，上限由环境变量 `SNIPFLOW_MAX_SNIP_SIZE` 决定
 
-验收测试（单元）：
-```
-合法请求体 → safeParse success: true
-type = "link" → success: false，issues 指向 type 字段
-content = "" → success: false，issues 指向 content 字段
-content 超过 SNIPFLOW_MAX_SNIP_SIZE → success: false，issues 指向 content 字段
-expiry.mode = "ttl" 且无 ttl → success: false，issues 指向 expiry.ttl
-expiry.mode = "forever" → success: true
-key = ""（创建请求）→ success: true
-key 包含 "/"、空格或超过 128 字符 → success: false，issues 指向 key 字段
-GET/DELETE path key 合法 → SnipKeyParamsSchema success: true
-cursor 缺省或为非空字符串 → ListSnipsQuerySchema success: true
-cursor = "" 或包含未知查询字段 → success: false
-```
+18. 实现 `SnipKeySchema`、`SnipKeyParamsSchema` 和严格的 `ListSnipsQuerySchema`。
+19. 实现 `CreateSnipHeadersSchema`：key 允许空值；source 1–256；filename 1–1024；TTL 是正整数字符串；overwrite 是 true/false；Content-Type 是合法 MIME；Expires 是可解析的 HTTP 日期；其余五个 HTTP metadata 值非空。
+20. 为每个边界值编写 safeParse 单元测试，不再创建 JSON body Schema，也不再定义 type 枚举。
+
+验收：
+
+~~~
+任意合法 MIME -> success: true
+非法 MIME / TTL / overwrite / Expires -> success: false
+key="" -> success: true
+非法 path key / 空 cursor / 未知 query -> success: false
+~~~
 
 ---
 
 ### 阶段五：服务层
 
-**目标：** 将业务规则编码为纯函数，不依赖 Hono context，覆盖所有业务分支。
+目标：编码纯业务规则，协调 KV/R2 并实现失败补偿。
 
 实现步骤：
-19. 编写 `src/services/snip/create.ts`：key 为空时生成随机 key 并检查冲突（最多重试 3 次），用户提供的 key 需检查是否已存在（`overwrite=false` 时冲突返回 `KeyConflictError`），先写 R2 再写 KV，按 expiry 设 TTL，更新计数器，R2 写入失败时回滚
-20. 编写 `src/services/snip/read.ts`：读 KV metadata + 读 R2 payload，任一不存在返回 NotFoundError
-21. 编写 `src/services/snip/list.ts`：KV list 分页，返回元数据列表
-22. 编写 `src/services/snip/delete.ts`：先删 KV 再删 R2，更新计数器
-23. 编写 `src/services/stats.ts`：读 KV 计数器，拼入 `SNIPFLOW_TOTAL_STORAGE_LIMIT`
 
-验收测试（单元）：
-```
-create key="" → 返回 meta.key 为非空随机字符串
-create key="abc" → 返回 meta.key = "abc"
-create key="abc"（已存在，overwrite=false）→ 抛出 KeyConflictError
-create key="abc"（已存在，overwrite=true）→ 成功覆盖
-create mode="ttl" → KV 条目携带 expiresAt
-create → stats count+1，totalSize += size
-delete → stats count-1，totalSize -= size
-read 不存在的 key → 抛出 NotFoundError
-delete 不存在的 key → 抛出 NotFoundError
-```
+21. 在 `services/snip/create.ts` 实现 key 解析和最多 3 次碰撞重试；overwrite=false 时先返回冲突。
+22. 覆盖前读取旧 KV 与 R2；将原始 payload、httpMetadata、customMetadata 写 R2，以返回的实际 size 校验上限并构造 KV `SnipMeta`。
+23. R2/ KV 写入失败时按 7.3 节回滚；成功后按新旧对象差更新 count/totalSize。
+24. 实现 `read.ts` 返回 `{ meta, payload: R2ObjectBody }`，`list.ts` 做 KV 分页并过滤 TTL 期间消失的条目，`delete.ts` 先删 KV 后删 R2。
+25. 实现 `services/stats.ts`，并对计数器和 storage limit 做非负整数校验。
+
+验收：
+
+~~~
+create arbitrary bytes -> R2/KV metadata 正确
+overwrite=false 冲突 -> 409
+overwrite=true -> count 不变、totalSize 按差值更新
+超限新建 -> 新 R2 对象已删除
+超限覆盖 -> 旧对象和全部 metadata 已恢复
+TTL / forever -> KV expiration 与 expiresAt 正确
+~~~
 
 ---
 
 ### 阶段六：路由层
 
-**目标：** 将服务层能力暴露为 HTTP 接口，端到端完整可用。
+目标：把服务能力暴露为当前 HTTP API，保持上传和下载流式。
 
 实现步骤：
-24. 编写 `src/routes/snip.ts`：使用 `CreateSnipSchema`、`SnipKeyParamsSchema`、`ListSnipsQuerySchema` 校验所有动态输入；调用 `services/snip/*`；通过显式字段映射构造对应响应 DTO，禁止直接展开 `SnipMeta`
-25. 编写 `src/routes/stats.ts`：调用 `services/stats`，返回类型为 `Stats` DTO
-26. 在 `app.ts` 中注册全部路由
 
-验收测试（集成）：
-```
-POST /snip（合法）→ 201，body 包含 key、type、size、createdAt
-POST /snip 缺字段 → 400 INVALID_INPUT，body 含 issues 列表
-POST /snip（key 已存在，overwrite=false）→ 409 KEY_CONFLICT
-POST /snip（key 已存在，overwrite=true）→ 201，成功覆盖
-GET  /snip/:key（存在）→ 200，body 包含 content
-GET  /snip/:key（不存在）→ 404 NOT_FOUND
-DELETE /snip/:key → 204
-GET  /snip → 200，body 包含 items 数组和 cursor
-GET  /stats → 200，body 包含 count / totalSize / storageLimit
-完整生命周期：create → read → list（count=1）→ delete → list（count=0）
-```
+26. 在 `routes/snip.ts` 的 POST handler 中读取原始 Headers，以 `CreateSnipHeadersSchema` 校验；构造六个字段的 `R2HTTPMetadata` 和白名单 `customMetadata`；校验 8192 字节后把 `c.req.raw.body` 原样传给 create service。
+27. POST 只返回显式 `CreateSnipResponse`；list 只返回显式 `ListSnipItem`，不展开 `SnipMeta`。
+28. GET `/:key` 读取 `R2ObjectBody`，用 `writeHttpMetadata`、`httpEtag`、`size` 和 filename 生成头，再直接返回 `payload.body`。
+29. 实现 DELETE、list cursor 和 stats 路由，在 `app.ts` 注册全部 router。
+
+验收：
+
+~~~
+POST arbitrary binary -> 201 JSON metadata
+GET  /snip/:key -> 原始字节 + 正确 HTTP metadata
+GET  /snip -> 不含正文/source/r2Key
+DELETE /snip/:key -> 204
+GET  /stats -> count/totalSize/storageLimit
+create -> read -> list -> delete 生命周期通过
+~~~
 
 ---
 
 ### 阶段七：定时清理任务
 
-**目标：** 自动清理 KV 已过期但 R2 对象仍存在的孤立数据。
+目标：回收 KV 已过期或删除后残留的 R2 对象。
 
 实现步骤：
-27. 编写 `src/jobs/cleanup.ts`：list R2 所有对象，查 KV，无元数据则删除 R2 对象
-28. 在 `src/index.ts` 中导出 `scheduled` handler
-29. 在 `wrangler.jsonc` 中配置 `"triggers": { "crons": ["0 * * * *"] }`
 
-验收测试（集成）：
-```
-R2 有对象、KV 有 metadata → cleanup 后 R2 对象仍存在
-R2 有对象、KV 无 metadata → cleanup 后 R2 对象被删除
-```
-本地用 `wrangler dev --test-scheduled` + `curl /__scheduled` 触发验证。
+30. 在 `jobs/cleanup.ts` 按 cursor 分页 list `snips/`，并行检查对应 KV key，只删除不存在索引的对象。
+31. 在 `index.ts` 导出 `scheduled` handler，记录结构化成功/失败日志；在 Wrangler 配置中添加 `"0 * * * *"`。
+
+验收：
+
+~~~
+有 KV 索引的 R2 对象 -> 保留
+无 KV 索引的 R2 对象 -> 删除
+其他前缀对象 -> 不处理
+pnpm exec wrangler dev --test-scheduled
+GET /__scheduled -> 执行任务
+~~~
 
 ---
 
-### 阶段八：部署与线上验收
+### 阶段八：全量验证与部署
 
-**目标：** 在真实 Cloudflare 环境中验证全链路正常运行。
+目标：在真实 Cloudflare 环境复现本地通过的完整链路。
 
 实现步骤：
-30. 在 Cloudflare Dashboard 创建 KV namespace 和 R2 bucket，填入 `wrangler.jsonc`
-31. 配置生产 secrets（`wrangler secret put SNIPFLOW_API_TOKEN` 等）
-32. `pnpm deploy`
 
-验收清单：
-```
-GET  /health → 200
-GET  /health/auth（正确 Token）→ 200
-GET  /health/auth（错误 Token，伪装模式开启）→ 200 Hello World
-POST /snip（TTL 模式）→ 201，等待过期后 GET 返回 404
-POST /snip（forever 模式）→ 201，DELETE 后 GET 返回 404
-GET  /stats → count 和 totalSize 与实际操作一致，storageLimit 与 SNIPFLOW_TOTAL_STORAGE_LIMIT 一致
-Cron 触发后孤立 R2 对象被清理（通过 R2 Dashboard 确认）
-```
+32. 运行 `pnpm exec tsc --noEmit`、`pnpm lint`、`pnpm test` 和 `git diff --check`。
+33. 登录 Cloudflare，创建 KV namespace 与 R2 bucket，把返回的 ID/名称填入 `wrangler.jsonc`，确认 binding 名严格为 `SNIPFLOW_KV` 和 `SNIPFLOW_R2`。
+34. 设置生产 Token 与三个非敏感变量，运行 `pnpm cf-typegen` 和 `pnpm deploy`。
+35. 按 README 的 curl 示例在线验证健康、认证、任意 MIME 上传、原始下载、列表、统计、删除和 TTL 清理。
+
+上线前兼容性检查：
+
+- 旧客户端发送的 `{ key, type, content, source, expiry }` JSON 包装不再接受，必须改成“原始 body + 请求头”。
+- `GET /snip/:key` 从 JSON 改为原始对象响应，调用方必须按 Content-Type/Content-Disposition 处理。
+- 旧 KV 数据包含 `type` 而没有 `contentType`、`filename`，新 `SnipMetaSchema` 会拒绝；部署前迁移或清空旧 `snip:*` 索引。
+- R2 路径 `snips/{key}/payload` 未改变，bucket 对象本身无需搬迁，但若清空 KV 索引，Cron 会把对应 R2 对象视为孤立对象；迁移完成前应暂停清理触发器。
+
+线上验收：
+
+~~~
+GET  /health -> 200
+GET  /health/auth（正确 Token）-> 200
+POST /snip（任意 MIME + TTL + custom metadata）-> 201
+GET  /snip/:key -> 字节、Content-Type、文件名一致
+GET  /snip -> contentType / filename / size 正确
+GET  /stats -> count / totalSize / storageLimit 正确
+DELETE /snip/:key -> 204，随后 GET -> 404
+Cron -> 只清理孤立 R2 对象
+~~~

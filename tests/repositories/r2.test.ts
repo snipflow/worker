@@ -13,11 +13,14 @@ describe('R2 Repository', () => {
   })
 
   describe('putPayload & getPayload', () => {
-    it('should write and read payload', async () => {
-      const content = 'Hello, World!'
-      await r2Repo.putPayload(r2, 'test-key', content, 'text/plain')
+    it('streams arbitrary bytes without converting them to text', async () => {
+      const content = new Uint8Array([0, 255, 1, 128, 42])
+      await r2Repo.putPayload(r2, 'test-key', content, {
+        httpMetadata: { contentType: 'application/x-custom-binary' },
+      })
       const retrieved = await r2Repo.getPayload(r2, 'test-key')
-      expect(retrieved).toBe(content)
+
+      expect(new Uint8Array(await retrieved!.arrayBuffer())).toEqual(content)
     })
 
     it('should return null for non-existent key', async () => {
@@ -25,16 +28,42 @@ describe('R2 Repository', () => {
       expect(result).toBeNull()
     })
 
-    it('should store with correct content type', async () => {
-      await r2Repo.putPayload(r2, 'json-key', '{"test":true}', 'application/json')
+    it('stores complete HTTP and custom metadata', async () => {
+      const expires = new Date('2026-10-21T07:28:00.000Z')
+      await r2Repo.putPayload(r2, 'json-key', '{"test":true}', {
+        httpMetadata: {
+          contentType: 'application/json',
+          contentLanguage: 'zh-CN',
+          contentDisposition: 'inline',
+          contentEncoding: 'gzip',
+          cacheControl: 'private, max-age=60',
+          cacheExpiry: expires,
+        },
+        customMetadata: {
+          filename: 'data.json',
+          source: 'page',
+          category: 'report',
+        },
+      })
       const obj = await r2.get('snips/json-key/payload')
+
       expect(obj?.httpMetadata?.contentType).toBe('application/json')
+      expect(obj?.httpMetadata?.contentLanguage).toBe('zh-CN')
+      expect(obj?.httpMetadata?.contentDisposition).toBe('inline')
+      expect(obj?.httpMetadata?.contentEncoding).toBe('gzip')
+      expect(obj?.httpMetadata?.cacheControl).toBe('private, max-age=60')
+      expect(obj?.httpMetadata?.cacheExpiry).toEqual(expires)
+      expect(obj?.customMetadata).toEqual({
+        filename: 'data.json',
+        source: 'page',
+        category: 'report',
+      })
     })
   })
 
   describe('deletePayload', () => {
     it('should delete payload', async () => {
-      await r2Repo.putPayload(r2, 'delete-me', 'content', 'text/plain')
+      await r2Repo.putPayload(r2, 'delete-me', 'content')
       await r2Repo.deletePayload(r2, 'delete-me')
       const retrieved = await r2Repo.getPayload(r2, 'delete-me')
       expect(retrieved).toBeNull()
@@ -45,7 +74,7 @@ describe('R2 Repository', () => {
     it('should list all payload keys', async () => {
       const keys = ['key1', 'key2', 'key3']
       for (const key of keys) {
-        await r2Repo.putPayload(r2, key, `content-${key}`, 'text/plain')
+        await r2Repo.putPayload(r2, key, `content-${key}`)
       }
 
       const result = await r2Repo.listPayloads(r2)

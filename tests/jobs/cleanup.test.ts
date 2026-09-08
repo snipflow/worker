@@ -15,7 +15,8 @@ import { getPayload, putPayload } from '../../src/repositories/r2'
 function metadata(key: string): SnipMeta {
   return {
     key,
-    type: 'text',
+    contentType: 'text/plain',
+    filename: null,
     source: 'page',
     size: 7,
     createdAt: new Date().toISOString(),
@@ -45,8 +46,8 @@ beforeEach(clearStorage)
 describe('orphaned payload cleanup', () => {
   it('keeps payloads with KV metadata and deletes orphaned payloads', async () => {
     await Promise.all([
-      putPayload(env.SNIPFLOW_R2, 'retained', 'content', 'text/plain'),
-      putPayload(env.SNIPFLOW_R2, 'orphaned', 'content', 'text/plain'),
+      putPayload(env.SNIPFLOW_R2, 'retained', 'content'),
+      putPayload(env.SNIPFLOW_R2, 'orphaned', 'content'),
       env.SNIPFLOW_R2.put('unrelated/object', 'content'),
     ])
     await putSnip(env.SNIPFLOW_KV, 'retained', metadata('retained'))
@@ -54,13 +55,14 @@ describe('orphaned payload cleanup', () => {
     const result = await cleanupOrphanedPayloads(env)
 
     expect(result).toEqual({ scanned: 2, deleted: 1 })
-    expect(await getPayload(env.SNIPFLOW_R2, 'retained')).toBe('content')
+    const retained = await getPayload(env.SNIPFLOW_R2, 'retained')
+    expect(await retained?.text()).toBe('content')
     expect(await getPayload(env.SNIPFLOW_R2, 'orphaned')).toBeNull()
     expect(await env.SNIPFLOW_R2.get('unrelated/object')).not.toBeNull()
   })
 
   it('is wired to the Worker scheduled handler', async () => {
-    await putPayload(env.SNIPFLOW_R2, 'scheduled-orphan', 'content', 'text/plain')
+    await putPayload(env.SNIPFLOW_R2, 'scheduled-orphan', 'content')
     const controller = createScheduledController({ cron: '0 * * * *' })
     const ctx = createExecutionContext()
 
