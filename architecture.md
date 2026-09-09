@@ -154,9 +154,11 @@ API 边界约定：
 }
 ~~~
 
-- `count`：KV 计数器维护的 snip 数量。
-- `totalSize`：KV 计数器维护的正文总字节数。
+- `count`：R2 `meta/stats.json` 统计对象维护的 snip 数量。
+- `totalSize`：同一 R2 统计对象维护的正文总字节数。
 - `storageLimit`：`SNIPFLOW_TOTAL_STORAGE_LIMIT` 的静态配置值，不是从 R2 bucket 动态读取。
+- 两个动态字段通过 ETag 条件写入在同一次 CAS 中原子更新，不再使用最终一致的 KV
+  read-modify-write 计数器。
 
 ### 5.1 POST /snip — 创建或覆盖 snip
 
@@ -320,7 +322,8 @@ Worker 对响应执行以下映射：
 
 ## 7. 存储模型
 
-索引与负载分开存储：KV 支持分页列表、TTL 可见性和统计；R2 保存任意字节正文、HTTP metadata 与 custom metadata。正文格式不再被压扁为项目内的三种类型。
+索引与负载分开存储：KV 只负责分页索引和 TTL 可见性；R2 保存任意字节正文、
+HTTP metadata、custom metadata 以及强一致统计对象。正文格式不再被压扁为项目内的三种类型。
 
 ### 7.1 KV 存储（索引元数据）
 
@@ -352,8 +355,6 @@ return result.data
 await env.SNIPFLOW_KV.list({ prefix: 'snip:', limit: 100, cursor })
 await env.SNIPFLOW_KV.delete(`snip:${key}`)
 ~~~
-
-统计计数器使用 `meta:count` 和 `meta:totalSize`。创建、覆盖和删除按对象实际 R2 size 计算增量。
 
 KV 中的结构：
 
@@ -389,6 +390,9 @@ await env.SNIPFLOW_R2.put(
   `snips/${key}/payload`,
   payload,
   {
+    onlyIf: previousObject
+      ? { etagMatches: previousObject.etag }
+      : { etagDoesNotMatch: '*' },
     httpMetadata,
     customMetadata,
     storageClass,
@@ -396,7 +400,7 @@ await env.SNIPFLOW_R2.put(
 )
 ~~~
 
-当前 HTTP 路由把 `Request.body` 直接传给 `put`。仓储同时保留 `storageClass` 参数，供覆盖回滚时原样恢复；校验和、条件写入、SSE-C 等其他 `R2PutOptions` 尚未开放为公共 API。
+当前 HTTP 路由把 `Request.body` 直接传给 `put`。仓储同时保留 `storageClass` 参数，供覆盖回滚时原样恢复；`onlyIf` 由服务层内部使用，避免并发创建或覆盖同一 key。校验和、SSE-C 等其他 `R2PutOptions` 尚未开放为公共 API。
 
 读取必须保留流和 metadata：
 
@@ -408,26 +412,59 @@ return new Response(object.body, { headers })
 
 禁止在通用读取路径调用 `text()` 或 `arrayBuffer()` 缓冲整个对象。返回响应前使用 `writeHttpMetadata` 恢复标准头，并单独写入 `httpEtag` 与对象大小。
 
-### 7.3 创建、覆盖与删除的一致性
+### 7.3 R2 原子统计对象
 
-KV 和 R2 没有跨产品事务，服务层通过写入顺序和补偿回滚降低不一致风险。
+`count` 与 `totalSize` 不再拆成两个 KV key，而是共同存储在
+`meta/stats.json`：
+
+~~~json
+{
+  "count": 42,
+  "totalSize": 10485760
+}
+~~~
+
+`repositories/r2-stats.ts` 以 R2 强一致读和 ETag 条件写入实现 CAS：
+
+1. 读取当前统计对象和 ETag；对象不存在时以 `{ count: 0, totalSize: 0 }` 为基线。
+2. 在内存中同时应用 count 与 totalSize delta，并拒绝负数、非整数或非安全值。
+3. 已存在对象使用 `etagMatches`，首次创建使用 `etagDoesNotMatch: '*'`。
+4. 条件失败返回 `null`，重新读取最新版并重试，最多 16 次。
+5. 两个字段写入同一个 JSON 对象，因此单次增减不会只成功一半。
+
+R2 没有原生 increment 指令；这里的“原子增减”指基于 ETag 的乐观并发控制。
+同一对象 key 的写入吞吐仍受 R2 平台限制，因此该方案适合当前低写入量服务，
+不应作为高频全局计数器使用。
+
+统计对象不在 `snips/` 前缀下，不会被 payload 列表或孤儿清理误处理。
+`GET /stats` 在对象缺失时返回零值；从旧版本升级且已有 payload 时，必须先按现存
+`snips/*/payload` 对象的数量和 size 创建该对象，旧 KV
+`meta:count`/`meta:totalSize` 不再读取。
+
+### 7.4 创建、覆盖与删除的一致性
+
+KV 和 R2 没有跨产品事务，服务层通过 R2 条件写入、原子统计 CAS、写入顺序和补偿
+回滚降低不一致风险。
 
 创建或覆盖：
 
 1. 解析 key，读取旧 KV 元数据。
 2. 覆盖时读取旧 `R2ObjectBody`，保留正文流、`httpMetadata`、`customMetadata` 和 `storageClass`。
-3. 写新 R2 对象。
+3. 新建使用 `etagDoesNotMatch: '*'`，覆盖使用旧 ETag 的 `etagMatches` 条件写入；并发输家返回冲突，不执行回滚或计数。
 4. 按 R2 返回的实际 `size` 校验上限。
 5. 写 KV 索引及 TTL。
-6. 按新旧 size 差值更新计数器。
+6. 通过单次 R2 CAS 同时应用 count 和 totalSize 差值。
 
-第 3–5 步失败时：
+第 3–6 步失败时：
 
 - 新建对象：删除已写入的 R2 对象。
 - 覆盖对象：用旧正文和全部对象 metadata 恢复原对象。
+- KV 已写入时，同时恢复旧 KV metadata；原对象带 TTL 时按剩余时间恢复。
 - 回滚本身失败：抛出同时包含原始错误与回滚错误的 `AggregateError`。
 
-删除顺序保持“先 KV、后 R2”。如果 R2 删除失败，对象已不可通过 API 到达，后续由 Cron 清理。KV 先到期形成的孤立 R2 对象也走同一清理链路。
+删除先原子递减统计，再删除 KV metadata 和 R2 payload；任一删除失败时恢复已删除的
+metadata，并通过反向 CAS 恢复统计。KV 先到期形成的孤立 R2 对象由 Cron 按实际
+R2 size 汇总递减统计后批量删除；批量删除失败时同样反向恢复统计。
 
 ## 8. 内部分层
 
@@ -458,12 +495,13 @@ src/
       create.ts             冲突、R2/KV 写入、实际大小校验、补偿回滚
       list.ts               KV 分页列表
       read.ts               联合读取 KV 与 R2ObjectBody
-      delete.ts             删除与计数器更新
+      delete.ts             原子统计递减、删除与失败补偿
     stats.ts                存储统计
 
   repositories/
-    kv.ts                   KV CRUD、分页、计数器、持久化 Schema 边界
-    r2.ts                   通用字节正文和对象 metadata 的 CRUD / list
+    kv.ts                   KV 索引 CRUD、分页、持久化 Schema 边界
+    r2-payload.ts           payload 正文和对象 metadata 的 CRUD / list
+    r2-stats.ts             R2 统计对象校验、ETag CAS 与原子增减
 
   domain/
     types.ts                Payload、SnipMeta、服务输入和公开 DTO
@@ -508,6 +546,10 @@ src/
 
 使用 Vitest + `@cloudflare/vitest-pool-workers`，在 Workers 运行时和真实 KV/R2 测试 binding 中执行，不用手写存储 mock。
 
+覆盖率使用 `@vitest/coverage-istanbul`；Workers 测试池不支持原生 V8 覆盖率。
+门禁为 statements 90%、branches 80%、functions 95%、lines 90%，
+`pnpm test:coverage` 未达到任一阈值即失败。
+
 测试分层：
 
 | 层级 | 覆盖目标 |
@@ -515,7 +557,7 @@ src/
 | repositories | KV Schema 边界、对象路径、任意字节、完整 R2 metadata、分页和空值 |
 | schemas | header、MIME、TTL、overwrite、HTTP 日期、key 与 cursor 边界 |
 | utils | 文件名解析、UTF-8 编码、metadata 白名单与 8192 字节计算 |
-| services | 生成 key、冲突、覆盖、TTL、实际大小、计数器与补偿回滚 |
+| services | 生成 key、R2 条件冲突、覆盖、TTL、实际大小、原子统计与补偿回滚 |
 | routes | 原始 HTTP body、标准/自定义 metadata、流式下载、错误与完整生命周期 |
 | jobs | 分页扫描，只删除没有 KV 索引的 `snips/` 对象 |
 
@@ -525,9 +567,15 @@ _repositories/kv_
 
 - 合法 `SnipMeta` 往返一致。
 - 非法 JSON、旧 `type` 结构或缺失 `contentType` 的数据抛出 `InternalError`。
-- TTL、删除、分页和计数器行为正确。
+- TTL、删除和分页行为正确；KV 不再保存统计计数器。
 
 _repositories/r2_
+_repositories/r2-stats_
+
+- 统计对象缺失时返回零值。
+- count 与 totalSize 在同一次 ETag CAS 中更新。
+- 并发更新发生条件冲突时重试，最终不丢增量。
+- 拒绝负数、非整数、非法 JSON 和不符合 Schema 的历史值。
 
 - 字符串与二进制逐字节往返。
 - `httpMetadata` 与 `customMetadata` 可写入并读取。
@@ -535,6 +583,7 @@ _repositories/r2_
 
 _schemas 与 utils_
 
+- 条件创建/覆盖同一 key 时只有一个并发写入者成功。
 - 接受标准和 vendor MIME，拒绝缺少斜线等非法值。
 - 接受缺省 key，拒绝带斜线、空格或超过 128 字符的 key。
 - TTL 只接受正整数字符串；overwrite 只接受 true/false。
@@ -549,6 +598,8 @@ _services/snip/create_
 - 已存在 key 且 overwrite=false 返回 `KeyConflictError`。
 - 任意 payload 和完整 metadata 被原样传给 R2。
 - 以 R2 实际 size 写 KV 与 stats。
+- 并发创建同一 key 只有一个成功且只计数一次。
+- stats 更新失败时恢复 payload 与 KV metadata，包括旧 TTL。
 - 超限新建删除 R2；超限覆盖恢复旧正文、HTTP metadata、custom metadata 与 storageClass。
 - TTL 对象写入 expiresAt 与 KV expirationTtl。
 
@@ -560,7 +611,7 @@ _routes_
 - filename 在缺少 Content-Disposition 时生成 RFC 5987 下载头。
 - custom metadata 仅接收 `X-Snip-Meta-*`。
 - 列表不返回正文、source、custom metadata 或 `r2Key`。
-- 401、400、409、413、415、404 与伪装模式行为正确。
+- 401、400、409、HTTP 层 413、415、404 与伪装模式行为正确。
 
 _jobs/cleanup_
 
@@ -568,6 +619,8 @@ _jobs/cleanup_
 - R2 有对象但 KV 无索引：删除。
 - 不属于 `snips/` 前缀的 R2 对象不处理。
 
+- 删除孤儿前按对象实际 size 原子递减 R2 统计。
+- 批量删除失败时反向恢复统计。
 ## 11. Roadmap
 
 以下步骤以空目录为起点，按顺序可以复刻当前项目。每个阶段都给出可独立验证的验收点；实现细节以本文件前述类型、Schema、存储顺序和 API 契约为准。
@@ -580,7 +633,7 @@ _jobs/cleanup_
 
 实现步骤：
 
-1. 初始化 ESM TypeScript 项目，使用 pnpm；安装运行依赖 `hono`、`nanoid`、`zod`，开发依赖 `wrangler`、`typescript-eslint`、`vitest`、`@cloudflare/vitest-pool-workers`、`@cloudflare/workers-types` 和 `@vitest/coverage-v8`。
+1. 初始化 ESM TypeScript 项目，使用 pnpm；安装运行依赖 `hono`、`nanoid`、`zod`，开发依赖 `wrangler`、`typescript-eslint`、`vitest`、`@cloudflare/vitest-pool-workers`、`@cloudflare/workers-types` 和与 Vitest 同版本的 `@vitest/coverage-istanbul`。
 2. 添加与当前仓库一致的 scripts：`dev`、`deploy`、`cf-typegen`、`lint`、`test`、`test:watch`、`test:coverage`。
 3. 创建严格模式 `tsconfig.json`、ESLint 配置和 `vitest.config.ts`；Vitest 指向 `./wrangler.jsonc`。
 4. 创建 `wrangler.jsonc.example`，声明 `main: "src/index.ts"`、`SNIPFLOW_KV`、`SNIPFLOW_R2`、每小时 Cron，以及四个变量：
@@ -637,8 +690,8 @@ PUT  /health           -> 405
 13. 在 `domain/types.ts` 定义 `SnipExpiry`、`SnipPayload`、`CreateSnipInput`、`SnipMeta`、`CreateSnipResponse`、`ListSnipItem`、`ListSnipsResponse` 和 `Stats`。
 14. 在 `utils/key.ts` 用 nanoid 的 62 字符字母表生成 5 位 key；在 `utils/time.ts` 实现当前时间和 TTL 到 ISO 时间转换。
 15. 新建 `utils/r2-metadata.ts`：解析 X-Snip-Filename、解析 Content-Disposition、从 `X-Snip-Meta-*` 构造白名单 custom metadata、按 UTF-8 统计大小、生成 RFC 5987 Content-Disposition。
-16. 在 `repositories/kv.ts` 实现 `getSnip`、`keyExists`、`putSnip`、`deleteSnip`、`listSnips` 和计数器；所有 JSON 读取通过 `SnipMetaSchema`。
-17. 在 `repositories/r2.ts` 实现 `putPayload`、`getPayload`、`deletePayload`、`listPayloads`。put 接收通用 `SnipPayload` 和 `httpMetadata/customMetadata/storageClass`，get 返回 `R2ObjectBody`，不得调用 `text()`。
+16. 在 `repositories/kv.ts` 实现 `getSnip`、`keyExists`、`putSnip`、`deleteSnip` 和 `listSnips`；所有 JSON 读取通过 `SnipMetaSchema`，不在 KV 中维护计数器。
+17. 在 `repositories/r2-payload.ts` 实现 payload CRUD、条件 put、批量 delete 和带 size 的 list；在 `repositories/r2-stats.ts` 实现单对象统计 Schema、ETag CAS 和最多 16 次冲突重试。
 
 验收：
 
@@ -681,9 +734,9 @@ key="" -> success: true
 
 21. 在 `services/snip/create.ts` 实现 key 解析和最多 3 次碰撞重试；overwrite=false 时先返回冲突。
 22. 覆盖前读取旧 KV 与 R2；将原始 payload、httpMetadata、customMetadata 写 R2，以返回的实际 size 校验上限并构造 KV `SnipMeta`。
-23. R2/ KV 写入失败时按 7.3 节回滚；成功后按新旧对象差更新 count/totalSize。
-24. 实现 `read.ts` 返回 `{ meta, payload: R2ObjectBody }`，`list.ts` 做 KV 分页并过滤 TTL 期间消失的条目，`delete.ts` 先删 KV 后删 R2。
-25. 实现 `services/stats.ts`，并对计数器和 storage limit 做非负整数校验。
+23. 按 7.4 节用 R2 ETag 条件创建/覆盖 payload；失败时回滚 R2 与 KV；成功后通过一次 CAS 同时应用 count/totalSize 差值。
+24. 实现 `read.ts` 返回 `{ meta, payload: R2ObjectBody }`，`list.ts` 做 KV 分页并过滤 TTL 期间消失的条目，`delete.ts` 先原子递减统计再删除 KV/R2，失败时补偿。
+25. 实现 `services/stats.ts`，从 R2 统计对象读取动态值，并对 storage limit 做非负整数校验。
 
 验收：
 
@@ -728,14 +781,14 @@ create -> read -> list -> delete 生命周期通过
 
 实现步骤：
 
-30. 在 `jobs/cleanup.ts` 按 cursor 分页 list `snips/`，并行检查对应 KV key，只删除不存在索引的对象。
+30. 在 `jobs/cleanup.ts` 按 cursor 分页 list `snips/`，并行检查对应 KV key；按孤儿对象实际 size 原子递减统计后批量删除，失败时反向恢复统计。
 31. 在 `index.ts` 导出 `scheduled` handler，记录结构化成功/失败日志；在 Wrangler 配置中添加 `"0 * * * *"`。
 
 验收：
 
 ~~~
 有 KV 索引的 R2 对象 -> 保留
-无 KV 索引的 R2 对象 -> 删除
+无 KV 索引的 R2 对象 -> 删除并同步递减统计
 其他前缀对象 -> 不处理
 pnpm exec wrangler dev --test-scheduled
 GET /__scheduled -> 执行任务
@@ -749,7 +802,7 @@ GET /__scheduled -> 执行任务
 
 实现步骤：
 
-32. 运行 `pnpm exec tsc --noEmit`、`pnpm lint`、`pnpm test` 和 `git diff --check`。
+32. 运行 `pnpm exec tsc --noEmit`、`pnpm lint`、`pnpm test`、`pnpm test:coverage` 和 `git diff --check`。
 33. 登录 Cloudflare，创建 KV namespace 与 R2 bucket，把返回的 ID/名称填入 `wrangler.jsonc`，确认 binding 名严格为 `SNIPFLOW_KV` 和 `SNIPFLOW_R2`。
 34. 设置生产 Token 与三个非敏感变量，运行 `pnpm cf-typegen` 和 `pnpm deploy`。
 35. 按 README 的 curl 示例在线验证健康、认证、任意 MIME 上传、原始下载、列表、统计、删除和 TTL 清理。
@@ -760,6 +813,9 @@ GET /__scheduled -> 执行任务
 - `GET /snip/:key` 从 JSON 改为原始对象响应，调用方必须按 Content-Type/Content-Disposition 处理。
 - 旧 KV 数据包含 `type` 而没有 `contentType`、`filename`，新 `SnipMetaSchema` 会拒绝；部署前迁移或清空旧 `snip:*` 索引。
 - R2 路径 `snips/{key}/payload` 未改变，bucket 对象本身无需搬迁，但若清空 KV 索引，Cron 会把对应 R2 对象视为孤立对象；迁移完成前应暂停清理触发器。
+- 旧 KV `meta:count`/`meta:totalSize` 不再读取；如果已有 payload，部署前按
+  `snips/*/payload` 的对象数量和 size 创建 R2 `meta/stats.json`。全新或空 bucket
+  无需迁移，首次创建会从零值原子初始化。
 
 线上验收：
 

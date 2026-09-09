@@ -1,13 +1,17 @@
 import { env } from 'cloudflare:workers'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   KeyConflictError,
   NotFoundError,
   PayloadTooLargeError,
 } from '../../src/domain/errors'
 import type { CreateSnipInput } from '../../src/domain/types'
-import { getSnip, setCounter } from '../../src/repositories/kv'
-import { deletePayload, getPayload, putPayload } from '../../src/repositories/r2'
+import { getSnip } from '../../src/repositories/kv'
+import { deletePayload, getPayload, putPayload } from '../../src/repositories/r2-payload'
+import {
+  STORAGE_STATS_KEY,
+  updateStorageStats,
+} from '../../src/repositories/r2-stats'
 import { createSnip } from '../../src/services/snip/create'
 import { deleteSnip } from '../../src/services/snip/delete'
 import { listSnips } from '../../src/services/snip/list'
@@ -57,8 +61,7 @@ async function clearStorage(): Promise<void> {
     r2Cursor = page.truncated ? page.cursor : undefined
   } while (r2Cursor)
 
-  await env.SNIPFLOW_KV.delete('meta:count')
-  await env.SNIPFLOW_KV.delete('meta:totalSize')
+  await env.SNIPFLOW_R2.delete(STORAGE_STATS_KEY)
 }
 
 beforeEach(clearStorage)
@@ -100,6 +103,29 @@ describe('createSnip', () => {
       createSnip(bindings(), createInput({ key: 'abc', payload: 'new' }))
     ).rejects.toBeInstanceOf(KeyConflictError)
     expect(await payloadText('abc')).toBe('old')
+  })
+
+  it('counts only the winner of concurrent creates for the same key', async () => {
+    const results = await Promise.allSettled([
+      createSnip(bindings(), createInput({ key: 'same-key', payload: 'first' })),
+      createSnip(bindings(), createInput({ key: 'same-key', payload: 'second' })),
+    ])
+
+    const fulfilled = results.filter(result => result.status === 'fulfilled')
+    const rejected = results.filter(result => result.status === 'rejected')
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]).toMatchObject({
+      reason: expect.any(KeyConflictError),
+    })
+
+    const stored = await payloadText('same-key')
+    expect(['first', 'second']).toContain(stored)
+    await expect(getStats(env)).resolves.toEqual({
+      count: 1,
+      totalSize: stored?.length,
+      storageLimit,
+    })
   })
 
   it('overwrites arbitrary payload and adjusts size without incrementing count', async () => {
@@ -187,6 +213,54 @@ describe('createSnip', () => {
     expect(restored?.httpMetadata?.contentType).toBe('text/markdown; charset=utf-8')
     expect(restored?.customMetadata?.filename).toBe('note.md')
   })
+
+  it('rolls back payload and KV metadata when the stats object is invalid', async () => {
+    await env.SNIPFLOW_R2.put(
+      STORAGE_STATS_KEY,
+      JSON.stringify({ count: -1, totalSize: 0 })
+    )
+
+    await expect(createSnip(
+      bindings(),
+      createInput({ key: 'rollback-stats' })
+    )).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+
+    expect(await getSnip(env.SNIPFLOW_KV, 'rollback-stats')).toBeNull()
+    expect(await getPayload(env.SNIPFLOW_R2, 'rollback-stats')).toBeNull()
+  })
+
+  it('restores an expiring object when overwrite stats validation fails', async () => {
+    const previous = await createSnip(
+      bindings(),
+      createInput({
+        key: 'rollback-overwrite',
+        payload: 'old',
+        expiry: { mode: 'ttl', ttl: 3600 },
+      })
+    )
+    await env.SNIPFLOW_R2.put(
+      STORAGE_STATS_KEY,
+      JSON.stringify({ count: -1, totalSize: 3 })
+    )
+
+    await expect(createSnip(
+      bindings(),
+      createInput({
+        key: 'rollback-overwrite',
+        payload: 'replacement',
+        overwrite: true,
+      })
+    )).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+
+    expect(await payloadText('rollback-overwrite')).toBe('old')
+    expect(await getSnip(env.SNIPFLOW_KV, 'rollback-overwrite')).toEqual(previous)
+    const listed = await env.SNIPFLOW_KV.list({
+      prefix: 'snip:rollback-overwrite',
+    })
+    expect(listed.keys[0]?.expiration).toBeGreaterThan(
+      Math.floor(Date.now() / 1000)
+    )
+  })
 })
 
 describe('readSnip', () => {
@@ -243,12 +317,39 @@ describe('deleteSnip', () => {
   it('throws NotFoundError for an unknown key', async () => {
     await expect(deleteSnip(bindings(), 'missing')).rejects.toBeInstanceOf(NotFoundError)
   })
+
+  it('restores metadata and stats when the R2 delete fails', async () => {
+    const created = await createSnip(
+      bindings(),
+      createInput({ key: 'delete-rollback', payload: 'content' })
+    )
+    const deleteSpy = vi
+      .spyOn(env.SNIPFLOW_R2, 'delete')
+      .mockRejectedValueOnce(new Error('simulated R2 delete failure'))
+
+    try {
+      await expect(deleteSnip(bindings(), 'delete-rollback'))
+        .rejects.toThrowError('simulated R2 delete failure')
+    } finally {
+      deleteSpy.mockRestore()
+    }
+
+    expect(await getSnip(env.SNIPFLOW_KV, 'delete-rollback')).toEqual(created)
+    expect(await payloadText('delete-rollback')).toBe('content')
+    await expect(getStats(env)).resolves.toEqual({
+      count: 1,
+      totalSize: 7,
+      storageLimit,
+    })
+  })
 })
 
 describe('getStats', () => {
-  it('reads both counters and the configured storage limit', async () => {
-    await setCounter(env.SNIPFLOW_KV, 'count', 4)
-    await setCounter(env.SNIPFLOW_KV, 'totalSize', 1234)
+  it('reads the R2 stats object and configured storage limit', async () => {
+    await updateStorageStats(env.SNIPFLOW_R2, {
+      count: 4,
+      totalSize: 1234,
+    })
 
     await expect(getStats(env)).resolves.toEqual({
       count: 4,
@@ -264,8 +365,20 @@ describe('getStats', () => {
   })
 
   it('rejects invalid counter values at the DTO boundary', async () => {
-    await env.SNIPFLOW_KV.put('meta:count', 'not-a-number')
+    await env.SNIPFLOW_R2.put(
+      STORAGE_STATS_KEY,
+      JSON.stringify({ count: -1, totalSize: 0 })
+    )
 
     await expect(getStats(env)).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+  })
+
+  it('rejects an invalid storage limit binding', async () => {
+    await expect(getStats({
+      SNIPFLOW_R2: env.SNIPFLOW_R2,
+      SNIPFLOW_TOTAL_STORAGE_LIMIT: 'invalid',
+    })).rejects.toMatchObject({
+      code: 'INTERNAL_ERROR',
+    })
   })
 })

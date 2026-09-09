@@ -1,7 +1,7 @@
 import { NotFoundError } from '../../domain/errors'
 import type { SnipMeta } from '../../domain/types'
 import { getSnip } from '../../repositories/kv'
-import { getPayload } from '../../repositories/r2'
+import { getPayload } from '../../repositories/r2-payload'
 
 type ReadSnipBindings = Pick<
   CloudflareBindings,

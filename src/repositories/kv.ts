@@ -87,28 +87,3 @@ export async function listSnips(
     cursor: result.list_complete ? undefined : result.cursor,
   }
 }
-
-/**
- * 获取计数器值
- */
-export async function getCounter(kv: KVNamespace, counterName: string): Promise<number> {
-  const raw = await kv.get(`meta:${counterName}`)
-  return raw ? parseInt(raw, 10) : 0
-}
-
-/**
- * 设置计数器值
- */
-export async function setCounter(kv: KVNamespace, counterName: string, value: number): Promise<void> {
-  await kv.put(`meta:${counterName}`, String(value))
-}
-
-/**
- * 递增计数器
- */
-export async function incrementCounter(kv: KVNamespace, counterName: string, delta: number): Promise<number> {
-  const current = await getCounter(kv, counterName)
-  const newValue = current + delta
-  await setCounter(kv, counterName, newValue)
-  return newValue
-}

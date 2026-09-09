@@ -1,12 +1,18 @@
 import { KeyConflictError, PayloadTooLargeError } from '../../domain/errors'
 import type { CreateSnipInput, SnipMeta } from '../../domain/types'
 import {
+  deleteSnip as deleteSnipMeta,
   getSnip,
-  incrementCounter,
   keyExists,
   putSnip,
 } from '../../repositories/kv'
-import { deletePayload, getPayload, putPayload } from '../../repositories/r2'
+import {
+  deletePayload,
+  getPayload,
+  putPayload,
+  putPayloadConditionally,
+} from '../../repositories/r2-payload'
+import { updateStorageStats } from '../../repositories/r2-stats'
 import { generateKey } from '../../utils/key'
 import { nowISO, ttlToExpiresAt } from '../../utils/time'
 
@@ -54,6 +60,27 @@ async function restorePayload(
   await deletePayload(r2, key)
 }
 
+function remainingExpirationTtl(meta: SnipMeta): number | undefined {
+  if (!meta.expiresAt) return undefined
+  const seconds = Math.ceil(
+    (new Date(meta.expiresAt).getTime() - Date.now()) / 1000
+  )
+  return Math.max(60, seconds)
+}
+
+async function restoreMetadata(
+  kv: KVNamespace,
+  key: string,
+  previousMeta: SnipMeta | null
+): Promise<void> {
+  if (previousMeta) {
+    await putSnip(kv, key, previousMeta, remainingExpirationTtl(previousMeta))
+    return
+  }
+
+  await deleteSnipMeta(kv, key)
+}
+
 /**
  * 创建或覆盖 snip。服务仅依赖 Worker bindings 与领域输入，不依赖 Hono context。
  */
@@ -77,13 +104,25 @@ export async function createSnip(
     ? await getPayload(bindings.SNIPFLOW_R2, key)
     : null
   const expirationTtl = input.expiry.mode === 'ttl' ? input.expiry.ttl : undefined
+  let payloadWritten = false
+  let metadataWritten = false
   let meta: SnipMeta
 
   try {
-    const stored = await putPayload(bindings.SNIPFLOW_R2, key, input.payload, {
-      httpMetadata: input.httpMetadata,
-      customMetadata: input.customMetadata,
-    })
+    const stored = await putPayloadConditionally(
+      bindings.SNIPFLOW_R2,
+      key,
+      input.payload,
+      {
+        onlyIf: previousPayload
+          ? { etagMatches: previousPayload.etag }
+          : { etagDoesNotMatch: '*' },
+        httpMetadata: input.httpMetadata,
+        customMetadata: input.customMetadata,
+      }
+    )
+    if (!stored) throw new KeyConflictError()
+    payloadWritten = true
     if (stored.size > input.maxSize) {
       throw new PayloadTooLargeError()
     }
@@ -101,26 +140,40 @@ export async function createSnip(
       r2Key: `snips/${key}/payload`,
     }
     await putSnip(bindings.SNIPFLOW_KV, key, meta, expirationTtl)
+    metadataWritten = true
+
+    const countDelta = previousMeta ? 0 : 1
+    const sizeDelta = meta.size - (previousMeta?.size ?? 0)
+    if (countDelta !== 0 || sizeDelta !== 0) {
+      await updateStorageStats(bindings.SNIPFLOW_R2, {
+        count: countDelta,
+        totalSize: sizeDelta,
+      })
+    }
   } catch (error) {
+    if (!payloadWritten) throw error
+
+    const rollbackErrors: unknown[] = []
     try {
       await restorePayload(bindings.SNIPFLOW_R2, key, previousMeta, previousPayload)
-    } catch (rollbackError) {
+    } catch (rollbackError: unknown) {
+      rollbackErrors.push(rollbackError)
+    }
+    if (metadataWritten) {
+      try {
+        await restoreMetadata(bindings.SNIPFLOW_KV, key, previousMeta)
+      } catch (rollbackError: unknown) {
+        rollbackErrors.push(rollbackError)
+      }
+    }
+
+    if (rollbackErrors.length > 0) {
       throw new AggregateError(
-        [error, rollbackError],
-        'Failed to create snip and roll back its R2 payload'
+        [error, ...rollbackErrors],
+        'Failed to create snip and roll back storage'
       )
     }
     throw error
-  }
-
-  const countDelta = previousMeta ? 0 : 1
-  const sizeDelta = meta.size - (previousMeta?.size ?? 0)
-
-  if (countDelta !== 0) {
-    await incrementCounter(bindings.SNIPFLOW_KV, 'count', countDelta)
-  }
-  if (sizeDelta !== 0) {
-    await incrementCounter(bindings.SNIPFLOW_KV, 'totalSize', sizeDelta)
   }
 
   return meta

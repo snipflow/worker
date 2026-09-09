@@ -12,8 +12,6 @@ describe('KV Repository', () => {
     // 清理测试数据
     const list = await kv.list({ prefix: 'snip:' })
     await Promise.all(list.keys.map(k => kv.delete(k.name)))
-    await kv.delete('meta:count')
-    await kv.delete('meta:totalSize')
   })
 
   describe('getSnip & putSnip', () => {
@@ -138,28 +136,6 @@ describe('KV Repository', () => {
     it('should return empty array when no snips exist', async () => {
       const result = await kvRepo.listSnips(kv)
       expect(result.keys).toHaveLength(0)
-    })
-  })
-
-  describe('counter operations', () => {
-    it('should get default counter value of 0', async () => {
-      const count = await kvRepo.getCounter(kv, 'count')
-      expect(count).toBe(0)
-    })
-
-    it('should set and get counter value', async () => {
-      await kvRepo.setCounter(kv, 'count', 42)
-      const count = await kvRepo.getCounter(kv, 'count')
-      expect(count).toBe(42)
-    })
-
-    it('should increment counter', async () => {
-      await kvRepo.setCounter(kv, 'totalSize', 100)
-      const newValue = await kvRepo.incrementCounter(kv, 'totalSize', 50)
-      expect(newValue).toBe(150)
-
-      const retrieved = await kvRepo.getCounter(kv, 'totalSize')
-      expect(retrieved).toBe(150)
     })
   })
 })

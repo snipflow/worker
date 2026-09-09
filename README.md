@@ -212,6 +212,10 @@ curl \
 }
 ~~~
 
+`count` 与 `totalSize` 存在同一个 R2 统计对象中，并通过 ETag 条件写入共同更新。
+这能避免 Workers KV 最终一致性造成的负数或丢失增量；高频并发写入场景仍建议改用
+Durable Object 或 D1。
+
 ### 删除对象
 
 ~~~bash
@@ -346,6 +350,11 @@ custom metadata 的 key/value UTF-8 字节数合计最多 8192。Authorization�
 - 不再使用 `text`、`image`、`file` 三种类型。
 - `GET /snip/:key` 不再返回包含 `content` 的 JSON，而是直接返回对象。
 - 旧 KV 索引只有 `type`，缺少 `contentType` 和 `filename`，部署前必须迁移或清空旧 `snip:*` 数据。
+- 旧 KV `meta:count` 和 `meta:totalSize` 不再读取。
+
+如果升级时 bucket 中已有 `snips/*/payload`，部署前需要按现存对象数量和 size 创建
+R2 `meta/stats.json`；全新或空 bucket 无需处理，首次上传会从零值自动创建。
+统计对象格式及安全迁移步骤见 [architecture.md 的 R2 原子统计章节](./architecture.md#73-r2-原子统计对象)。
 
 R2 对象路径仍为 `snips/{key}/payload`。注意：如果直接清空 KV，而每小时 Cron 仍启用，现有 R2 对象会被判定为孤立对象并删除。迁移期间请暂停清理触发器，或先重建新的 KV 索引。
 

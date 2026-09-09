@@ -64,3 +64,10 @@ export interface Stats {
   totalSize: number
   storageLimit: number
 }
+
+export type StorageStats = Pick<Stats, 'count' | 'totalSize'>
+
+export interface StorageStatsDelta {
+  count: number
+  totalSize: number
+}

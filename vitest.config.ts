@@ -9,8 +9,14 @@ export default defineConfig({
   ],
   test: {
     coverage: {
-      provider: 'v8',
+      provider: 'istanbul',
       reporter: ['text', 'html'],
+      thresholds: {
+        statements: 90,
+        branches: 80,
+        functions: 95,
+        lines: 90,
+      },
     },
   },
 })

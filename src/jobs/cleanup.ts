@@ -1,5 +1,9 @@
 import { keyExists } from '../repositories/kv'
-import { deletePayload, listPayloads } from '../repositories/r2'
+import {
+  deletePayloads,
+  listPayloads,
+} from '../repositories/r2-payload'
+import { updateStorageStats } from '../repositories/r2-stats'
 
 type CleanupBindings = Pick<
   CloudflareBindings,
@@ -24,16 +28,39 @@ export async function cleanupOrphanedPayloads(
   do {
     const page = await listPayloads(bindings.SNIPFLOW_R2, cursor)
     const existence = await Promise.all(
-      page.keys.map(key => keyExists(bindings.SNIPFLOW_KV, key))
+      page.items.map(item => keyExists(bindings.SNIPFLOW_KV, item.key))
     )
-    const orphanedKeys = page.keys.filter((_key, index) => !existence[index])
+    const orphaned = page.items.filter((_item, index) => !existence[index])
 
-    await Promise.all(
-      orphanedKeys.map(key => deletePayload(bindings.SNIPFLOW_R2, key))
-    )
+    if (orphaned.length > 0) {
+      const delta = {
+        count: -orphaned.length,
+        totalSize: -orphaned.reduce((total, item) => total + item.size, 0),
+      }
+      await updateStorageStats(bindings.SNIPFLOW_R2, delta)
+      try {
+        await deletePayloads(
+          bindings.SNIPFLOW_R2,
+          orphaned.map(item => item.key)
+        )
+      } catch (error) {
+        try {
+          await updateStorageStats(bindings.SNIPFLOW_R2, {
+            count: -delta.count,
+            totalSize: -delta.totalSize,
+          })
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            'Failed to clean orphaned payloads and roll back storage stats'
+          )
+        }
+        throw error
+      }
+    }
 
-    scanned += page.keys.length
-    deleted += orphanedKeys.length
+    scanned += page.items.length
+    deleted += orphaned.length
     cursor = page.cursor
   } while (cursor)
 

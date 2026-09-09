@@ -1,5 +1,6 @@
 import { exports, env } from 'cloudflare:workers'
 import { describe, it, expect } from 'vitest'
+import { maxSnipSize } from '../src/middleware/guard'
 
 interface ErrorResponse {
   error: {
@@ -96,6 +97,68 @@ describe('Middleware Layer', () => {
         method: 'PATCH'
       })
       expect(res.status).toBe(405)
+    })
+  })
+
+  describe('Body size guard', () => {
+    it('returns 413 for an invalid Content-Length', async () => {
+      const res = await exports.default.fetch('http://localhost/snip', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`,
+          'content-length': 'invalid',
+          'content-type': 'application/octet-stream',
+          'x-snip-source': 'page',
+        },
+        body: new Uint8Array([1]),
+      })
+
+      expect(res.status).toBe(413)
+      const json = await res.json() as ErrorResponse
+      expect(json.error.code).toBe('PAYLOAD_TOO_LARGE')
+      expect(json.error.message).toBe('Invalid Content-Length')
+    })
+
+    it('returns 413 before storage when Content-Length exceeds the limit', async () => {
+      const res = await exports.default.fetch('http://localhost/snip', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`,
+          'content-length': String(Number(env.SNIPFLOW_MAX_SNIP_SIZE) + 1),
+          'content-type': 'application/octet-stream',
+          'x-snip-key': 'too-large',
+          'x-snip-source': 'page',
+        },
+        body: new Uint8Array([1]),
+      })
+
+      expect(res.status).toBe(413)
+      const json = await res.json() as ErrorResponse
+      expect(json.error.code).toBe('PAYLOAD_TOO_LARGE')
+      expect(await env.SNIPFLOW_R2.get('snips/too-large/payload')).toBeNull()
+    })
+
+    it('accepts a valid Content-Length within the limit', async () => {
+      const res = await exports.default.fetch('http://localhost/snip', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`,
+          'content-length': '1',
+          'content-type': 'application/octet-stream',
+          'x-snip-source': 'page',
+        },
+        body: new Uint8Array([1]),
+      })
+
+      expect(res.status).toBe(201)
+    })
+
+    it('rejects an invalid maximum-size binding', () => {
+      const bindings = { SNIPFLOW_MAX_SNIP_SIZE: '0' }
+
+      expect(() => maxSnipSize(bindings)).toThrowError(
+        'Invalid SNIPFLOW_MAX_SNIP_SIZE configuration'
+      )
     })
   })
 

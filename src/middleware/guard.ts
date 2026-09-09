@@ -14,7 +14,11 @@ export const methodGuard: MiddlewareHandler = async (c, next) => {
   await next()
 }
 
-export function maxSnipSize(bindings: CloudflareBindings): number {
+export function maxSnipSize(
+  bindings: {
+    SNIPFLOW_MAX_SNIP_SIZE: string
+  }
+): number {
   const configured = Number(bindings.SNIPFLOW_MAX_SNIP_SIZE)
   if (!Number.isSafeInteger(configured) || configured <= 0) {
     throw new InternalError('Invalid SNIPFLOW_MAX_SNIP_SIZE configuration')

@@ -1,8 +1,8 @@
 import { env } from 'cloudflare:workers'
 import { describe, it, expect, beforeEach } from 'vitest'
-import * as r2Repo from '../../src/repositories/r2'
+import * as r2Repo from '../../src/repositories/r2-payload'
 
-describe('R2 Repository', () => {
+describe('R2 Payload Repository', () => {
   let r2: R2Bucket
 
   beforeEach(async () => {
@@ -78,13 +78,29 @@ describe('R2 Repository', () => {
       }
 
       const result = await r2Repo.listPayloads(r2)
-      expect(result.keys).toHaveLength(3)
-      expect(result.keys.sort()).toEqual(['key1', 'key2', 'key3'])
+      expect(result.items).toHaveLength(3)
+      expect(result.items).toEqual(expect.arrayContaining([
+        { key: 'key1', size: 12 },
+        { key: 'key2', size: 12 },
+        { key: 'key3', size: 12 },
+      ]))
     })
 
     it('should return empty array when no payloads exist', async () => {
       const result = await r2Repo.listPayloads(r2)
-      expect(result.keys).toHaveLength(0)
+      expect(result.items).toHaveLength(0)
+    })
+
+    it('deletes multiple payloads in one operation', async () => {
+      await Promise.all([
+        r2Repo.putPayload(r2, 'first', 'first'),
+        r2Repo.putPayload(r2, 'second', 'second'),
+      ])
+
+      await r2Repo.deletePayloads(r2, ['first', 'second'])
+      await expect(r2Repo.deletePayloads(r2, [])).resolves.toBeUndefined()
+
+      expect((await r2Repo.listPayloads(r2)).items).toEqual([])
     })
   })
 })

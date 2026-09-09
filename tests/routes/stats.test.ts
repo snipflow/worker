@@ -1,15 +1,16 @@
 import { env, exports } from 'cloudflare:workers'
 import { beforeEach, describe, expect, it } from 'vitest'
+import {
+  STORAGE_STATS_KEY,
+  updateStorageStats,
+} from '../../src/repositories/r2-stats'
 
 const authHeaders = {
   Authorization: 'Bearer ' + env.SNIPFLOW_API_TOKEN,
 }
 
 beforeEach(async () => {
-  await Promise.all([
-    env.SNIPFLOW_KV.delete('meta:count'),
-    env.SNIPFLOW_KV.delete('meta:totalSize'),
-  ])
+  await env.SNIPFLOW_R2.delete(STORAGE_STATS_KEY)
 })
 
 describe('GET /stats', () => {
@@ -19,10 +20,10 @@ describe('GET /stats', () => {
   })
 
   it('returns the Stats DTO', async () => {
-    await Promise.all([
-      env.SNIPFLOW_KV.put('meta:count', '2'),
-      env.SNIPFLOW_KV.put('meta:totalSize', '42'),
-    ])
+    await updateStorageStats(env.SNIPFLOW_R2, {
+      count: 2,
+      totalSize: 42,
+    })
 
     const response = await exports.default.fetch('http://localhost/stats', {
       headers: authHeaders,

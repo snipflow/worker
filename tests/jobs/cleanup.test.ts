@@ -5,12 +5,16 @@ import {
   waitOnExecutionContext,
 } from 'cloudflare:test'
 import { env } from 'cloudflare:workers'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import worker from '../../src/index'
 import type { SnipMeta } from '../../src/domain/types'
 import { cleanupOrphanedPayloads } from '../../src/jobs/cleanup'
 import { putSnip } from '../../src/repositories/kv'
-import { getPayload, putPayload } from '../../src/repositories/r2'
+import { getPayload, putPayload } from '../../src/repositories/r2-payload'
+import {
+  getStorageStats,
+  updateStorageStats,
+} from '../../src/repositories/r2-stats'
 
 function metadata(key: string): SnipMeta {
   return {
@@ -50,6 +54,10 @@ describe('orphaned payload cleanup', () => {
       putPayload(env.SNIPFLOW_R2, 'orphaned', 'content'),
       env.SNIPFLOW_R2.put('unrelated/object', 'content'),
     ])
+    await updateStorageStats(env.SNIPFLOW_R2, {
+      count: 2,
+      totalSize: 14,
+    })
     await putSnip(env.SNIPFLOW_KV, 'retained', metadata('retained'))
 
     const result = await cleanupOrphanedPayloads(env)
@@ -59,10 +67,42 @@ describe('orphaned payload cleanup', () => {
     expect(await retained?.text()).toBe('content')
     expect(await getPayload(env.SNIPFLOW_R2, 'orphaned')).toBeNull()
     expect(await env.SNIPFLOW_R2.get('unrelated/object')).not.toBeNull()
+    await expect(getStorageStats(env.SNIPFLOW_R2)).resolves.toEqual({
+      count: 1,
+      totalSize: 7,
+    })
+  })
+
+  it('restores stats when orphan deletion fails', async () => {
+    await putPayload(env.SNIPFLOW_R2, 'failed-orphan', 'content')
+    await updateStorageStats(env.SNIPFLOW_R2, {
+      count: 1,
+      totalSize: 7,
+    })
+    const deleteSpy = vi
+      .spyOn(env.SNIPFLOW_R2, 'delete')
+      .mockRejectedValueOnce(new Error('simulated batch delete failure'))
+
+    try {
+      await expect(cleanupOrphanedPayloads(env))
+        .rejects.toThrowError('simulated batch delete failure')
+    } finally {
+      deleteSpy.mockRestore()
+    }
+
+    expect(await getPayload(env.SNIPFLOW_R2, 'failed-orphan')).not.toBeNull()
+    await expect(getStorageStats(env.SNIPFLOW_R2)).resolves.toEqual({
+      count: 1,
+      totalSize: 7,
+    })
   })
 
   it('is wired to the Worker scheduled handler', async () => {
     await putPayload(env.SNIPFLOW_R2, 'scheduled-orphan', 'content')
+    await updateStorageStats(env.SNIPFLOW_R2, {
+      count: 1,
+      totalSize: 7,
+    })
     const controller = createScheduledController({ cron: '0 * * * *' })
     const ctx = createExecutionContext()
 
@@ -70,5 +110,26 @@ describe('orphaned payload cleanup', () => {
     await waitOnExecutionContext(ctx)
 
     expect(await getPayload(env.SNIPFLOW_R2, 'scheduled-orphan')).toBeNull()
+    await expect(getStorageStats(env.SNIPFLOW_R2)).resolves.toEqual({
+      count: 0,
+      totalSize: 0,
+    })
+  })
+
+  it('propagates scheduled cleanup failures after logging them', async () => {
+    await putPayload(env.SNIPFLOW_R2, 'uncounted-orphan', 'content')
+    const controller = createScheduledController({ cron: '0 * * * *' })
+    const ctx = createExecutionContext()
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    try {
+      await expect(worker.scheduled(controller, env, ctx))
+        .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    } finally {
+      errorSpy.mockRestore()
+    }
+
+    expect(await getPayload(env.SNIPFLOW_R2, 'uncounted-orphan'))
+      .not.toBeNull()
   })
 })

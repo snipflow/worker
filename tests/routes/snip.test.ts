@@ -1,5 +1,6 @@
 import { env, exports } from 'cloudflare:workers'
 import { beforeEach, describe, expect, it } from 'vitest'
+import { STORAGE_STATS_KEY } from '../../src/repositories/r2-stats'
 
 interface ErrorResponse {
   error: {
@@ -46,10 +47,7 @@ async function clearStorage(): Promise<void> {
     r2Cursor = page.truncated ? page.cursor : undefined
   } while (r2Cursor)
 
-  await Promise.all([
-    env.SNIPFLOW_KV.delete('meta:count'),
-    env.SNIPFLOW_KV.delete('meta:totalSize'),
-  ])
+  await env.SNIPFLOW_R2.delete(STORAGE_STATS_KEY)
 }
 
 async function create(
@@ -152,6 +150,16 @@ describe('snip routes', () => {
       ]))
   })
 
+  it('rejects custom metadata larger than the R2 limit', async () => {
+    const response = await create('content', {
+      'X-Snip-Meta-Large': 'x'.repeat(8192),
+    })
+
+    expect(response.status).toBe(400)
+    expect(((await response.json()) as ErrorResponse).error.code)
+      .toBe('INVALID_INPUT')
+  })
+
   it('requires a Content-Type but accepts every valid MIME type', async () => {
     const response = await exports.default.fetch('http://localhost/snip', {
       method: 'POST',
@@ -198,6 +206,21 @@ describe('snip routes', () => {
     expect(response.headers.get('etag')).toBeTruthy()
   })
 
+  it('falls back to indexed Content-Type when R2 HTTP metadata is absent', async () => {
+    await create()
+    await env.SNIPFLOW_R2.put('snips/route-test/payload', 'raw')
+
+    const response = await exports.default.fetch(
+      'http://localhost/snip/route-test',
+      { headers: authHeaders }
+    )
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type'))
+      .toBe('text/markdown; charset=utf-8')
+    expect(await response.text()).toBe('raw')
+  })
+
   it('returns NOT_FOUND for an unknown snip', async () => {
     const response = await exports.default.fetch('http://localhost/snip/missing', {
       headers: authHeaders,
@@ -216,9 +239,14 @@ describe('snip routes', () => {
       'http://localhost/snip?limit=10',
       { headers: authHeaders }
     )
+    const invalidDelete = await exports.default.fetch(
+      'http://localhost/snip/with%20space',
+      { method: 'DELETE', headers: authHeaders }
+    )
 
     expect(invalidPath.status).toBe(400)
     expect(invalidQuery.status).toBe(400)
+    expect(invalidDelete.status).toBe(400)
   })
 
   it('supports the complete create, read, list, delete lifecycle', async () => {
