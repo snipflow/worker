@@ -24,7 +24,7 @@ worker 是 Snipflow 的统一后端服务。它接收来自 Pages 前端、Teleg
 
 ~~~
 HTTP 请求
-  -> Request ID / Content-Length 预检 / 方法过滤
+  -> CORS 预检 / Request ID / Content-Length 预检 / 方法过滤
   -> Token 认证中间件（Bearer 校验）
   -> Content-Type 存在性检查
   -> 请求头、路径参数、查询参数校验（Zod）
@@ -68,6 +68,7 @@ export function handleError(err: Error, c: Context) {
 
 | 职责 | 实现方式 |
 |------|---------|
+| 跨域预检与响应头 | Hono `cors` 中间件；按 `SNIPFLOW_CORS_ORIGINS` 精确匹配 Origin，在方法过滤之前处理 `OPTIONS` |
 | 生成 / 透传 Request ID | [`hono/request-id`](https://hono.dev/docs/middleware/builtin/request-id) 内置中间件，通过 `c.get('requestId')` 获取，自动写入响应头 `X-Request-Id` |
 | Bearer Token 认证 | [`hono/bearer-auth`](https://hono.dev/docs/middleware/builtin/bearer-auth) 内置中间件，通过 `invalidToken` / `noAuthenticationHeader` 回调抛出 `UnauthorizedError` |
 | 请求体大小限制 | 自定义 `bodyLimitGuard` 读取 `SNIPFLOW_MAX_SNIP_SIZE`。有 `Content-Length` 时在写入前预检；无该头时在 R2 写入后以 `R2Object.size` 最终校验 |
@@ -78,6 +79,7 @@ export function handleError(err: Error, c: Context) {
 中间件挂载顺序与当前 `app.ts` 一致：
 
 ~~~ts
+app.use('*', (c, next) => createCorsMiddleware(c.env)(c, next))
 app.use('*', requestIdMiddleware)
 app.use('*', bodyLimitGuard)
 app.use('*', methodGuard)
@@ -89,6 +91,8 @@ app.use('/snip/*', auth)
 app.use('/stats', auth)
 app.use('/snip', contentTypeGuard)
 ~~~
+
+跨域配置只允许显式 Origin，不使用 `*`。预检请求中的请求头会按 API 协议过滤，并支持 `X-Snip-Meta-*` 扩展头；实际响应暴露 `Content-Length`、`Content-Disposition`、`ETag` 和 `X-Request-Id`。同源部署仍是 Page 的首选部署方式。
 
 请求体必须原样传给 R2。不能为了边读边计数而套一层普通 `TransformStream`，因为它会丢失 Workers 请求体携带的固定长度属性，R2 会以“stream must have a known length”拒绝写入。因此当前实现使用两级限制：
 
@@ -484,6 +488,7 @@ src/
   middleware/
     request-id.ts           Request ID 注入
     guard.ts                方法白名单、Content-Length 预检、大小配置校验
+    cors.ts                 CORS Origin 白名单、预检和响应头
     auth.ts                 Bearer Token 认证
     content-type.ts         写请求必须声明 Content-Type
 

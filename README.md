@@ -72,6 +72,20 @@ export SNIPFLOW_URL="https://你的-worker.workers.dev"
 export SNIPFLOW_TOKEN="你的-token"
 ~~~
 
+### 跨域浏览器调用
+
+Worker 使用 Hono CORS 中间件处理浏览器的 `OPTIONS` 预检请求和实际响应。若前端与 Worker 不同源，请在 `wrangler.jsonc` 中把 `SNIPFLOW_CORS_ORIGINS` 设置为前端的精确 Origin，例如：
+
+~~~jsonc
+{
+  "vars": {
+    "SNIPFLOW_CORS_ORIGINS": "https://page.example.com,http://localhost:10010"
+  }
+}
+~~~
+
+不要把私有 Bearer Token API 配置为 `*`。如果 Page 和 Worker 通过同一域名提供服务，则优先使用同源路由，此时可以不配置跨域来源。跨域预检会在方法守卫之前处理，允许 `GET`、`POST`、`DELETE` 以及 `Authorization`、`Content-Type`、`X-Snip-*` 等项目请求头。
+
 ### 本地启动
 
 ~~~bash
