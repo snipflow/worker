@@ -1,6 +1,7 @@
 import { env, exports } from 'cloudflare:workers'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { STORAGE_STATS_KEY } from '../../src/repositories/r2-stats'
+import { ensureTestApiToken, TEST_API_TOKEN } from '../setup-api-token'
 
 interface ErrorResponse {
   error: {
@@ -11,8 +12,9 @@ interface ErrorResponse {
   }
 }
 
+const apiToken = TEST_API_TOKEN
 const authHeaders: Record<string, string> = {
-  Authorization: 'Bearer ' + env.SNIPFLOW_API_TOKEN,
+  Authorization: 'Bearer ' + apiToken,
 }
 
 function uploadHeaders(overrides: Record<string, string | null> = {}): Headers {
@@ -60,6 +62,8 @@ async function create(
     body: payload,
   })
 }
+
+beforeAll(ensureTestApiToken)
 
 beforeEach(clearStorage)
 

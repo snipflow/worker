@@ -1,6 +1,7 @@
 import { exports, env } from 'cloudflare:workers'
-import { describe, it, expect } from 'vitest'
+import { beforeAll, describe, it, expect } from 'vitest'
 import { maxSnipSize } from '../src/middleware/guard'
+import { ensureTestApiToken, TEST_API_TOKEN } from './setup-api-token'
 
 interface ErrorResponse {
   error: {
@@ -9,6 +10,10 @@ interface ErrorResponse {
     requestId: string
   }
 }
+
+const apiToken = TEST_API_TOKEN
+
+beforeAll(ensureTestApiToken)
 
 describe('Middleware Layer', () => {
   describe('Health endpoints', () => {
@@ -36,7 +41,7 @@ describe('Middleware Layer', () => {
 
     it('GET /health/auth returns 200 with correct token', async () => {
       const res = await exports.default.fetch('http://localhost/health/auth', {
-        headers: { 'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}` }
+        headers: { 'Authorization': `Bearer ${apiToken}` }
       })
       expect(res.status).toBe(200)
       expect(await res.json()).toEqual({ ok: true, authed: true })
@@ -68,7 +73,7 @@ describe('Middleware Layer', () => {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`
+          'Authorization': `Bearer ${apiToken}`
         },
         body: '{}'
       })
@@ -78,7 +83,7 @@ describe('Middleware Layer', () => {
     it('allows DELETE with proper headers', async () => {
       const res = await exports.default.fetch('http://localhost/snip/test', {
         method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}` }
+        headers: { 'Authorization': `Bearer ${apiToken}` }
       })
       expect(res.status).not.toBe(405)
     })
@@ -105,7 +110,7 @@ describe('Middleware Layer', () => {
       const res = await exports.default.fetch('http://localhost/snip', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`,
+          'Authorization': `Bearer ${apiToken}`,
           'content-length': 'invalid',
           'content-type': 'application/octet-stream',
           'x-snip-source': 'page',
@@ -123,7 +128,7 @@ describe('Middleware Layer', () => {
       const res = await exports.default.fetch('http://localhost/snip', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`,
+          'Authorization': `Bearer ${apiToken}`,
           'content-length': String(Number(env.SNIPFLOW_MAX_SNIP_SIZE) + 1),
           'content-type': 'application/octet-stream',
           'x-snip-key': 'too-large',
@@ -142,7 +147,7 @@ describe('Middleware Layer', () => {
       const res = await exports.default.fetch('http://localhost/snip', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`,
+          'Authorization': `Bearer ${apiToken}`,
           'content-length': '1',
           'content-type': 'application/octet-stream',
           'x-snip-source': 'page',
@@ -167,7 +172,7 @@ describe('Middleware Layer', () => {
       const res = await exports.default.fetch('http://localhost/snip', {
         method: 'POST',
         body: new Uint8Array([1, 2, 3]),
-        headers: { 'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}` }
+        headers: { 'Authorization': `Bearer ${apiToken}` }
       })
       expect(res.status).toBe(415)
       const json = await res.json() as ErrorResponse
@@ -181,7 +186,7 @@ describe('Middleware Layer', () => {
         headers: {
           'content-type': 'text/plain',
           'x-snip-source': 'page',
-          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`
+          'Authorization': `Bearer ${apiToken}`
         }
       })
       expect(res.status).toBe(201)
@@ -194,7 +199,7 @@ describe('Middleware Layer', () => {
         headers: {
           'content-type': 'application/json',
           'x-snip-source': 'page',
-          'Authorization': `Bearer ${env.SNIPFLOW_API_TOKEN}`
+          'Authorization': `Bearer ${apiToken}`
         }
       })
       expect(res.status).not.toBe(415)

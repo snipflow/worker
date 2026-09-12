@@ -4,11 +4,17 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-09",
   "vars": {
-    "SNIPFLOW_API_TOKEN": "<YOUR_API_TOKEN>",
     "SNIPFLOW_TOTAL_STORAGE_LIMIT": "104857600",
     "SNIPFLOW_MAX_SNIP_SIZE": "10485760",
     "SNIPFLOW_DISGUISE": "false"
   },
+  "secrets_store_secrets": [
+    {
+      "binding": "SNIPFLOW_API_TOKEN",
+      "store_id": "<YOUR_SECRETS_STORE_ID>",
+      "secret_name": "SNIPFLOW_API_TOKEN"
+    }
+  ],
   "kv_namespaces": [
     {
       "binding": "SNIPFLOW_KV",

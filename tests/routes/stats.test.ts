@@ -1,13 +1,17 @@
 import { env, exports } from 'cloudflare:workers'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
   STORAGE_STATS_KEY,
   updateStorageStats,
 } from '../../src/repositories/r2-stats'
+import { ensureTestApiToken, TEST_API_TOKEN } from '../setup-api-token'
 
+const apiToken = TEST_API_TOKEN
 const authHeaders = {
-  Authorization: 'Bearer ' + env.SNIPFLOW_API_TOKEN,
+  Authorization: 'Bearer ' + apiToken,
 }
+
+beforeAll(ensureTestApiToken)
 
 beforeEach(async () => {
   await env.SNIPFLOW_R2.delete(STORAGE_STATS_KEY)

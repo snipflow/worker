@@ -2,7 +2,7 @@
 
 Snipflow Worker 是部署在 Cloudflare Workers 上的轻量对象存储 API。它可以保存文本、JSON、图片、文档和任意二进制内容，不要求 JSON 包装，也不限制为固定的文件类别。
 
-你只需要一个 Cloudflare 账号、一个 KV namespace、一个 R2 bucket 和一个访问 Token。本文面向部署者和 API 使用者；如需了解内部实现或从零复刻项目，请阅读 [architecture.md](./architecture.md)。
+你只需要一个 Cloudflare 账号、一个 KV namespace、一个 R2 bucket 和一个访问 Token。Token 存放在 Cloudflare Secrets Store 中，不写入 Worker 配置。本文面向部署者和 API 使用者；如需了解内部实现或从零复刻项目，请阅读 [architecture.md](./architecture.md)。
 
 ## 快速部署
 
@@ -18,23 +18,42 @@ pnpm exec wrangler login
 
 `wrangler.jsonc` 已被 `.gitignore` 忽略。请不要提交真实 Token 或 Cloudflare 资源 ID。
 
-### 2. 创建 KV 和 R2
+### 2. 创建 KV、R2 和 Secrets Store Secret
 
 ~~~bash
 pnpm exec wrangler kv namespace create snipflow-kv
 pnpm exec wrangler r2 bucket create snipflow-r2
 ~~~
 
+先准备一个 Secrets Store。账号目前只能有一个 Store；如果已经存在，直接使用 `store list` 输出的 ID：
+
+~~~bash
+pnpm exec wrangler secrets-store store list --remote
+pnpm exec wrangler secrets-store store create snipflow --remote  # 仅在账号还没有 Store 时执行
+pnpm exec wrangler secrets-store secret create <STORE_ID> \
+  --name SNIPFLOW_API_TOKEN --scopes workers --remote
+~~~
+
+最后一条命令会交互式提示输入 Token。当前 Cloudflare API Token 需要 `Account Secrets Store Edit` 权限，且部署绑定 Secrets Store 也需要该权限。
+
 把命令输出的 KV namespace ID 和 R2 bucket 名称填入 `wrangler.jsonc`：
 
 - `SNIPFLOW_KV.id`：KV namespace ID
 - `SNIPFLOW_R2.bucket_name`：R2 bucket 名称
-- `SNIPFLOW_API_TOKEN`：客户端调用 API 时使用的 Bearer Token
+- `secrets_store_secrets[0].store_id`：上面 Secrets Store 的 ID
+- `secrets_store_secrets[0].secret_name`：`SNIPFLOW_API_TOKEN`
 - `SNIPFLOW_MAX_SNIP_SIZE`：单个对象最大字节数，默认 10 MiB
 - `SNIPFLOW_TOTAL_STORAGE_LIMIT`：`GET /stats` 返回的容量展示值，默认 100 MiB
 - `SNIPFLOW_DISGUISE`：`true` 时把错误伪装成 `200 Hello World`，默认 `false`
 
 建议使用足够长的随机 Token。`SNIPFLOW_TOTAL_STORAGE_LIMIT` 当前只用于统计响应，不会自动阻止总容量继续增长。
+
+本地开发不能读取 `--remote` 创建的生产 Secret。如需本地运行测试或 `pnpm dev`，使用相同的 Store ID 创建本地 Secret（不要加 `--remote`），值可以使用单独的开发 Token：
+
+~~~bash
+pnpm exec wrangler secrets-store secret create <STORE_ID> \
+  --name SNIPFLOW_API_TOKEN --scopes workers
+~~~
 
 ### 3. 校验并部署
 

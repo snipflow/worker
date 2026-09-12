@@ -636,12 +636,8 @@ _jobs/cleanup_
 1. 初始化 ESM TypeScript 项目，使用 pnpm；安装运行依赖 `hono`、`nanoid`、`zod`，开发依赖 `wrangler`、`typescript-eslint`、`vitest`、`@cloudflare/vitest-pool-workers`、`@cloudflare/workers-types` 和与 Vitest 同版本的 `@vitest/coverage-istanbul`。
 2. 添加与当前仓库一致的 scripts：`dev`、`deploy`、`cf-typegen`、`lint`、`test`、`test:watch`、`test:coverage`。
 3. 创建严格模式 `tsconfig.json`、ESLint 配置和 `vitest.config.ts`；Vitest 指向 `./wrangler.jsonc`。
-4. 创建 `wrangler.jsonc.example`，声明 `main: "src/index.ts"`、`SNIPFLOW_KV`、`SNIPFLOW_R2`、每小时 Cron，以及四个变量：
-   - `SNIPFLOW_API_TOKEN`
-   - `SNIPFLOW_TOTAL_STORAGE_LIMIT`
-   - `SNIPFLOW_MAX_SNIP_SIZE`
-   - `SNIPFLOW_DISGUISE`
-5. 复制为不提交的 `wrangler.jsonc`，填入 KV namespace ID、R2 bucket 名称和本地 Token，并在本地工作配置的 `dev` 中设置端口 10001、IP `0.0.0.0`；运行 `pnpm cf-typegen` 生成 `CloudflareBindings`。
+4. 创建 `wrangler.jsonc.example`，声明 `main: "src/index.ts"`、`SNIPFLOW_KV`、`SNIPFLOW_R2`、每小时 Cron、`SNIPFLOW_API_TOKEN` 的 Secrets Store binding，以及三个非敏感变量：`SNIPFLOW_TOTAL_STORAGE_LIMIT`、`SNIPFLOW_MAX_SNIP_SIZE`、`SNIPFLOW_DISGUISE`。
+5. 复制为不提交的 `wrangler.jsonc`，填入 KV namespace ID、R2 bucket 名称和 Secrets Store ID；使用不带 `--remote` 的 Secrets Store 命令创建本地开发 Token，并在本地工作配置的 `dev` 中设置端口 10001、IP `0.0.0.0`；运行 `pnpm cf-typegen` 生成 `CloudflareBindings`。
 6. 编写 `src/index.ts` 导出 Hono fetch handler，编写 `src/app.ts` 注册 `GET /health` 返回 `{ "ok": true }`。
 
 验收：
@@ -664,7 +660,7 @@ GET /health -> 200 {"ok":true}
 8. 在 `middleware/request-id.ts` 挂载 `hono/request-id`。
 9. 在 `middleware/guard.ts` 实现 GET/POST/DELETE 白名单、`SNIPFLOW_MAX_SNIP_SIZE` 正整数配置校验，以及 POST 的 `Content-Length` 预检。
 10. 在 `middleware/content-type.ts` 要求 POST/PUT 存在 Content-Type，不限定 MIME。
-11. 在 `middleware/auth.ts` 使用 `hono/bearer-auth` 校验 `SNIPFLOW_API_TOKEN`。
+11. 在 `middleware/auth.ts` 使用 `hono/bearer-auth` 异步读取 `SNIPFLOW_API_TOKEN` 的 Secrets Store binding，并用 constant-time 比较校验 Bearer Token。
 12. 添加 `GET /health/auth`，并严格按 4.2 节顺序挂载中间件。
 
 验收：
