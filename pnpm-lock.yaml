@@ -24,6 +24,9 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^5.20260724.1
         version: 5.20260724.1
+      '@types/node':
+        specifier: ^26.5.1
+        version: 26.5.1
       '@vitest/coverage-istanbul':
         specifier: ^4.1.10
         version: 4.1.10(vitest@4.1.10)
@@ -38,7 +41,7 @@ importers:
         version: 8.65.0(eslint@10.7.0(jiti@2.7.0))(typescript@6.0.3)
       vitest:
         specifier: ^4.1.10
-        version: 4.1.10(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0))
+        version: 4.1.10(@types/node@26.5.1)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0))
       wrangler:
         specifier: ^4.4.0
         version: 4.107.1(@cloudflare/workers-types@5.20260724.1)
@@ -899,6 +902,9 @@ packages:
   '@types/json-schema@7.0.15':
     resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
 
+  '@types/node@26.5.1':
+    resolution: {integrity: sha512-CzNm2FezW4VR/LjG6yUdiEgLE/rAQ9Slj5gCu/C2VrdcW7I0ahNZ8DRbHT7zOZ6r3ONgd/bsQIeSaoDGrd1C6g==}
+
   '@typescript-eslint/eslint-plugin@8.65.0':
     resolution: {integrity: sha512-IEgob78X12rHpUmtcwFsXhZdVGJtwTVP8FiCLZkR6GlYVrl2PcuB+KhCE5BlVC/eQpQnu8WXRtkHZuPar+gCRA==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
@@ -1547,6 +1553,9 @@ packages:
     engines: {node: '>=14.17'}
     hasBin: true
 
+  undici-types@8.9.0:
+    resolution: {integrity: sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==}
+
   undici@7.28.0:
     resolution: {integrity: sha512-cRZYrTDwWznlnRiPjggAGxZXanty6M8RV1ff8Wm4LWXBp7/IG8v5DnOm74DtUBp9OONpK75YlPnIjQqX0dBDtA==}
     engines: {node: '>=20.18.1'}
@@ -1848,7 +1857,7 @@ snapshots:
       cjs-module-lexer: 1.2.3
       esbuild: 0.28.1
       miniflare: 4.20260722.0
-      vitest: 4.1.10(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0))
+      vitest: 4.1.10(@types/node@26.5.1)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0))
       wrangler: 4.114.0(@cloudflare/workers-types@5.20260724.1)
       zod: 3.25.76
     transitivePeerDependencies:
@@ -2359,6 +2368,10 @@ snapshots:
 
   '@types/json-schema@7.0.15': {}
 
+  '@types/node@26.5.1':
+    dependencies:
+      undici-types: 8.9.0
+
   '@typescript-eslint/eslint-plugin@8.65.0(@typescript-eslint/parser@8.65.0(eslint@10.7.0(jiti@2.7.0))(typescript@6.0.3))(eslint@10.7.0(jiti@2.7.0))(typescript@6.0.3)':
     dependencies:
       '@eslint-community/regexpp': 4.12.2
@@ -2462,7 +2475,7 @@ snapshots:
       magicast: 0.5.3
       obug: 2.1.4
       tinyrainbow: 3.1.0
-      vitest: 4.1.10(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0))
+      vitest: 4.1.10(@types/node@26.5.1)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0))
     transitivePeerDependencies:
       - supports-color
 
@@ -2478,7 +2491,7 @@ snapshots:
       obug: 2.1.4
       std-env: 4.2.0
       tinyrainbow: 3.1.0
-      vitest: 4.1.10(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0))
+      vitest: 4.1.10(@types/node@26.5.1)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0))
     optional: true
 
   '@vitest/expect@4.1.10':
@@ -2490,13 +2503,13 @@ snapshots:
       chai: 6.2.2
       tinyrainbow: 3.1.0
 
-  '@vitest/mocker@4.1.10(vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0))':
+  '@vitest/mocker@4.1.10(vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0))':
     dependencies:
       '@vitest/spy': 4.1.10
       estree-walker: 3.0.3
       magic-string: 0.30.21
     optionalDependencies:
-      vite: 8.1.5(esbuild@0.28.1)(jiti@2.7.0)
+      vite: 8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0)
 
   '@vitest/pretty-format@4.1.10':
     dependencies:
@@ -3086,6 +3099,8 @@ snapshots:
 
   typescript@6.0.3: {}
 
+  undici-types@8.9.0: {}
+
   undici@7.28.0: {}
 
   unenv@2.0.0-rc.24:
@@ -3102,7 +3117,7 @@ snapshots:
     dependencies:
       punycode: 2.3.1
 
-  vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0):
+  vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0):
     dependencies:
       lightningcss: 1.33.0
       picomatch: 4.0.5
@@ -3110,14 +3125,15 @@ snapshots:
       rolldown: 1.1.5
       tinyglobby: 0.2.17
     optionalDependencies:
+      '@types/node': 26.5.1
       esbuild: 0.28.1
       fsevents: 2.3.3
       jiti: 2.7.0
 
-  vitest@4.1.10(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0)):
+  vitest@4.1.10(@types/node@26.5.1)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0)):
     dependencies:
       '@vitest/expect': 4.1.10
-      '@vitest/mocker': 4.1.10(vite@8.1.5(esbuild@0.28.1)(jiti@2.7.0))
+      '@vitest/mocker': 4.1.10(vite@8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0))
       '@vitest/pretty-format': 4.1.10
       '@vitest/runner': 4.1.10
       '@vitest/snapshot': 4.1.10
@@ -3134,9 +3150,10 @@ snapshots:
       tinyexec: 1.2.4
       tinyglobby: 0.2.17
       tinyrainbow: 3.1.0
-      vite: 8.1.5(esbuild@0.28.1)(jiti@2.7.0)
+      vite: 8.1.5(@types/node@26.5.1)(esbuild@0.28.1)(jiti@2.7.0)
       why-is-node-running: 2.3.0
     optionalDependencies:
+      '@types/node': 26.5.1
       '@vitest/coverage-istanbul': 4.1.10(vitest@4.1.10)
       '@vitest/coverage-v8': 4.1.10(vitest@4.1.10)
     transitivePeerDependencies:

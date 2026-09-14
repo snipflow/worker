@@ -6,6 +6,7 @@
     "deploy": "wrangler deploy --minify",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
     "lint": "eslint src tests",
+    "typecheck": "tsc --noEmit",
     "lint:fix": "eslint src tests --fix",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -19,6 +20,7 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.8",
     "@cloudflare/workers-types": "^5.20260724.1",
+    "@types/node": "^26.5.1",
     "@vitest/coverage-istanbul": "^4.1.10",
     "eslint": "^10.7.0",
     "jiti": "^2.7.0",
