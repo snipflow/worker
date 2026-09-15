@@ -1,0 +1,74 @@
+name: Deploy Worker
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy production Worker
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Write temporary Wrangler JSONC config
+        env:
+          WRANGLER_JSONC_CONTENT: ${{ secrets.WRANGLER_JSONC_CONTENT }}
+          WRANGLER_CONFIG_PATH: ${{ github.workspace }}/wrangler.deploy.jsonc
+        run: |
+          set -euo pipefail
+          if [ -z "${WRANGLER_JSONC_CONTENT:-}" ]; then
+            echo '::error::WRANGLER_JSONC_CONTENT is not configured'
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$WRANGLER_JSONC_CONTENT" > "$WRANGLER_CONFIG_PATH"
+          test -s "$WRANGLER_CONFIG_PATH"
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          packageManager: pnpm
+          wranglerVersion: "4.107.1"
+          command: deploy --config ${{ github.workspace }}/wrangler.deploy.jsonc --minify
+
+      - name: Remove temporary Wrangler config
+        if: always()
+        run: rm -f "${{ github.workspace }}/wrangler.deploy.jsonc"

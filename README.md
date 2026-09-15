@@ -72,6 +72,51 @@ export SNIPFLOW_URL="https://你的-worker.workers.dev"
 export SNIPFLOW_TOKEN="你的-token"
 ~~~
 
+### GitHub Actions 自动部署
+
+仓库中的 `.github/workflows/deploy.yml` 使用 Cloudflare 官方 Wrangler Action 部署生产 Worker。推送到 `master` 后，只有现有 `CI` 工作流成功，才会部署刚刚通过检查的 commit；也可以在 GitHub Actions 页面手动运行，但手动运行只允许选择 `master` 分支。
+
+在仓库的 **Settings → Secrets and variables → Actions** 中添加以下 repository secrets：
+
+| Secret | 内容 |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | 用于部署 Worker 及其配置绑定的 Cloudflare API Token |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账号 ID |
+| `WRANGLER_JSONC_CONTENT` | 完整的生产 Wrangler JSONC 配置 |
+
+`WRANGLER_JSONC_CONTENT` 必须是完整的 JSONC 内容，而不是文件路径。它至少应包含 Worker 名称、源码入口和兼容性日期，并按生产账号填写 KV、R2、Secrets Store 和变量配置。例如：
+
+~~~jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "snipflow-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-09",
+  "vars": {
+    "SNIPFLOW_TOTAL_STORAGE_LIMIT": "104857600",
+    "SNIPFLOW_MAX_SNIP_SIZE": "10485760"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SNIPFLOW_KV",
+      "id": "<YOUR_KV_NAMESPACE_ID>"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "SNIPFLOW_R2",
+      "bucket_name": "<YOUR_R2_BUCKET_NAME>"
+    }
+  ]
+}
+~~~
+
+请将本地 `wrangler.jsonc` 的完整内容直接复制到该 secret，并替换生产资源 ID。Action 会在 checkout 根目录临时写入 `wrangler.deploy.jsonc`，以便 `main: "src/index.ts"` 等相对路径正确解析；部署结束后会自动删除临时文件。生产配置不会写入仓库。
+
+这个项目只有根目录一个 package，因此 `pnpm-workspace.yaml` 不需要声明 `packages` 路径；文件中保留的 `allowBuilds` 只用于允许依赖执行必要的构建脚本。工作流固定使用 pnpm 12，避免旧版 pnpm 对这种设置文件的兼容性问题。
+
+如果账号仍连接着 Cloudflare Workers Builds 的原生自动部署，请先关闭它，避免同一次 push 同时触发两套部署流程。
+
 ### 跨域浏览器调用
 
 Worker 会处理浏览器的 `OPTIONS` 预检请求和实际响应。若前端与 Worker 不同源，请在 `wrangler.jsonc` 中把 `SNIPFLOW_CORS_ORIGINS` 设置为前端的精确 Origin，例如：
