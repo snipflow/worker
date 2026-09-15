@@ -31,12 +31,13 @@ function createInput(overrides: Partial<CreateSnipInput> = {}): CreateSnipInput 
   return {
     key: 'test-key',
     source: 'page',
+    filename: 'note.md',
     expiry: { mode: 'forever' },
     overwrite: false,
     maxSize: 1024,
     payload: 'hello world',
     httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-    customMetadata: { source: 'page', filename: 'note.md' },
+    customMetadata: { category: 'document' },
     ...overrides,
   }
 }
@@ -79,6 +80,24 @@ describe('createSnip', () => {
     const meta = await createSnip(bindings(), createInput({ key: 'abc' }))
 
     expect(meta.key).toBe('abc')
+  })
+
+  it('keeps canonical fields out of R2 custom metadata', async () => {
+    const meta = await createSnip(
+      bindings(),
+      createInput({
+        customMetadata: {
+          category: 'document',
+          source: 'legacy-source',
+          filename: 'legacy.txt',
+        },
+      })
+    )
+    const stored = await getPayload(env.SNIPFLOW_R2, meta.key)
+
+    expect(meta.source).toBe('page')
+    expect(meta.filename).toBe('note.md')
+    expect(stored?.customMetadata).toEqual({ category: 'document' })
   })
 
   it('tries at most three generated keys before reporting a conflict', async () => {
@@ -137,8 +156,9 @@ describe('createSnip', () => {
         key: 'abc',
         payload: bytes,
         overwrite: true,
+        filename: 'sample.bin',
         httpMetadata: { contentType: 'application/x-test' },
-        customMetadata: { source: 'page', filename: 'sample.bin' },
+        customMetadata: { category: 'binary' },
       })
     )
 
@@ -202,8 +222,9 @@ describe('createSnip', () => {
         payload: 'new content',
         overwrite: true,
         maxSize: 3,
+        filename: 'new.bin',
         httpMetadata: { contentType: 'application/x-new' },
-        customMetadata: { source: 'page', filename: 'new.bin' },
+        customMetadata: { category: 'replacement' },
       })
     )).rejects.toBeInstanceOf(PayloadTooLargeError)
 
@@ -211,7 +232,7 @@ describe('createSnip', () => {
     expect(await getSnip(env.SNIPFLOW_KV, 'restore-me')).toEqual(previous)
     const restored = await getPayload(env.SNIPFLOW_R2, 'restore-me')
     expect(restored?.httpMetadata?.contentType).toBe('text/markdown; charset=utf-8')
-    expect(restored?.customMetadata?.filename).toBe('note.md')
+    expect(restored?.customMetadata).toEqual({ category: 'document' })
   })
 
   it('rolls back payload and KV metadata when the stats object is invalid', async () => {
@@ -273,7 +294,7 @@ describe('readSnip', () => {
     expect(await result.payload.text()).toBe('hello world')
     expect(result.payload.httpMetadata?.contentType)
       .toBe('text/markdown; charset=utf-8')
-    expect(result.payload.customMetadata?.filename).toBe('note.md')
+    expect(result.payload.customMetadata).toEqual({ category: 'document' })
   })
 
   it('throws NotFoundError when metadata or payload is missing', async () => {

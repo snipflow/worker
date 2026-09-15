@@ -146,7 +146,19 @@ API 边界约定：
 - 所有动态请求头、路径参数和查询参数在路由边界用 Zod 校验。
 - KV JSON 属于持久化边界，反序列化后必须通过 `SnipMetaSchema`，禁止直接断言历史数据类型。
 - JSON 响应通过显式 DTO 映射构造，禁止把含内部 `r2Key` 的 `SnipMeta` 直接展开。
-- `GET /snip/:key` 是例外：它返回原始 R2 对象流和对象 HTTP metadata，不返回 JSON DTO。
+- `GET /snip/:key` 是例外：它返回原始 R2 对象流、标准 HTTP metadata 和 `X-Snip-*` 业务 metadata 头，不返回 JSON DTO。
+
+下载响应的业务 metadata 头：
+
+| Header | 来源与编码 |
+|---|---|
+| `X-Snip-Key` | KV `SnipMeta.key`，原值 |
+| `X-Snip-Source` | KV `SnipMeta.source`，URI 编码 |
+| `X-Snip-Filename` | KV `SnipMeta.filename`，URI 编码；空值时省略 |
+| `X-Snip-Created-At` | KV `SnipMeta.createdAt`，ISO 8601 |
+| `X-Snip-Expires-At` | KV `SnipMeta.expiresAt`，非空时返回 |
+
+`source` 与 `filename` 的 canonical value 来自 KV，而不是 R2 custom metadata。
 
 `GET /stats` 响应：
 
@@ -214,18 +226,18 @@ X-Snip-Meta-Category: finance
 
 `Expires` 在 Schema 边界解析成 `Date`。这些字段与 HTTP 标准头有直接映射，但 `Content-Type` 的值不是项目枚举：只要 MIME 语法合法即可。Worker 不猜测文件类型，也不根据后缀重写 Content-Type。
 
-custom metadata 映射：
+metadata 的存储映射：
 
-| 请求头 | R2 `customMetadata` |
+| 请求头 | 目标存储 |
 |------|------|
-| `X-Snip-Source: page` | `source: "page"` |
-| `X-Snip-Filename: report.pdf` | `filename: "report.pdf"` |
-| `X-Snip-Meta-Category: finance` | `category: "finance"` |
-| 其他 `X-Snip-Meta-*` | 前缀后的名称和值 |
+| `X-Snip-Source: page` | KV `SnipMeta.source = "page"` |
+| `X-Snip-Filename: report.pdf` | KV `SnipMeta.filename = "report.pdf"` |
+| `X-Snip-Meta-Category: finance` | R2 `customMetadata.category = "finance"` |
+| 其他 `X-Snip-Meta-*` | R2 custom metadata 中前缀后的名称和值 |
 
-请求头名称由 Fetch API 规范化，因此扩展 metadata key 按小写保存。`source` 和 `filename` 是规范字段，优先于同名 `X-Snip-Meta-*`。custom metadata 的 key/value UTF-8 字节数合计不得超过 8192；路由在调用 R2 前完成校验。
+请求头名称由 Fetch API 规范化，因此扩展 metadata key 按小写保存。新写入时 `source` 和 `filename` 不进入 R2 custom metadata；同名的 `X-Snip-Meta-*` 保留 key 也会被过滤。扩展 custom metadata 的 key/value UTF-8 字节数合计不得超过 8192；路由在调用 R2 前完成校验。
 
-仅保存六个标准 HTTP metadata 头、`source`、`filename` 和显式的 `X-Snip-Meta-*`。`Authorization`、`Cookie`、`Host`、`CF-*`、`Content-Length` 等认证或传输头不会被复制。
+R2 只保存六个标准 HTTP metadata 头和显式的 `X-Snip-Meta-*` 扩展 metadata。`Authorization`、`Cookie`、`Host`、`CF-*`、`Content-Length` 等认证或传输头不会被复制。
 
 TTL 仍由 KV 控制：`X-Snip-TTL` 存在时传给 KV `expirationTtl`，缺省时不设置过期。R2 不按单条 snip 的 KV TTL 自动删除；每小时运行的 Cron Trigger 扫描 `snips/`，删除已没有 `snip:{key}` KV 索引的孤立对象。
 
@@ -270,10 +282,11 @@ Worker 对响应执行以下映射：
 1. 调用 `R2ObjectBody.writeHttpMetadata(headers)` 恢复六个标准 HTTP metadata。
 2. 写入 `ETag` 和 `Content-Length`。
 3. 若 R2 没有 Content-Type，则用 KV 的 `contentType` 兜底。
-4. 若有 `customMetadata.filename` 但没有 Content-Disposition，则生成 `attachment; filename*=UTF-8''...`。
-5. 以 `new Response(payload.body, { headers })` 返回，不缓冲对象。
+4. 若 KV `SnipMeta.filename` 存在但没有 Content-Disposition，则生成 `attachment; filename*=UTF-8''...`。
+5. 将 KV 的 `key`、`source`、`filename`、`createdAt` 和可用的 `expiresAt` 映射为 `X-Snip-*` 响应头。
+6. 以 `new Response(payload.body, { headers })` 返回，不缓冲对象。
 
-除 filename 的下载头用途外，其他 custom metadata 当前不暴露给下载响应；它们保留在 R2 对象上供后续能力使用。
+R2 扩展 custom metadata 当前不会在下载响应中返回；业务 metadata 由 KV 的 `X-Snip-*` 响应头提供。
 
 ### 5.3 GET /snip — 列出所有 snip
 
@@ -303,7 +316,7 @@ Worker 对响应执行以下映射：
 |------|-------------------|------|
 | `POST /snip` | `CreateSnipHeadersSchema` | `CreateSnipResponse` JSON |
 | `GET /snip` | `ListSnipsQuerySchema` | `ListSnipsResponse` JSON |
-| `GET /snip/:key` | `SnipKeyParamsSchema` | 原始 `Response` 流 |
+| `GET /snip/:key` | `SnipKeyParamsSchema` | 原始 `Response` 流 + 标准 HTTP metadata + `X-Snip-*` 业务 metadata 头 |
 | `DELETE /snip/:key` | `SnipKeyParamsSchema` | 204，无正文 |
 | `GET /stats` | 无动态输入 | `Stats` JSON |
 
@@ -326,8 +339,8 @@ Worker 对响应执行以下映射：
 
 ## 7. 存储模型
 
-索引与负载分开存储：KV 只负责分页索引和 TTL 可见性；R2 保存任意字节正文、
-HTTP metadata、custom metadata 以及强一致统计对象。正文格式不再被压扁为项目内的三种类型。
+索引与负载分开存储：KV 保存分页索引、TTL 可见性和业务 metadata；R2 保存任意字节正文、
+HTTP metadata、扩展 custom metadata 以及强一致统计对象。正文格式不再被压扁为项目内的三种类型。
 
 ### 7.1 KV 存储（索引元数据）
 
@@ -375,11 +388,11 @@ KV 中的结构：
 }
 ~~~
 
-`r2Key` 是内部定位字段，不进入公开 JSON。R2 的正文与对象 metadata 是事实来源；KV 只保留列表和业务判断需要的冗余字段。
+`r2Key` 是内部定位字段，不进入公开 JSON。KV 是 `source`、`filename`、TTL 和列表信息的 canonical source；R2 是正文、标准 HTTP metadata 和扩展 custom metadata 的存储。两侧通过 key 和服务层写入流程保持关联。
 
 ### 7.2 R2 存储（正文和对象 metadata）
 
-对象 key 保持为 `snips/{key}/payload`。仓储方法接受 R2 支持的通用正文类型：
+对象 key 保持为 `snips/{key}/payload`。R2 只保存正文、标准 HTTP metadata 和显式 `X-Snip-Meta-*` 扩展 custom metadata；`source` 与 `filename` 只保存于 KV，避免同一业务字段出现两份可漂移的副本。仓储方法接受 R2 支持的通用正文类型：
 
 ~~~ts
 export type SnipPayload =
@@ -414,7 +427,7 @@ if (!object) throw new NotFoundError()
 return new Response(object.body, { headers })
 ~~~
 
-禁止在通用读取路径调用 `text()` 或 `arrayBuffer()` 缓冲整个对象。返回响应前使用 `writeHttpMetadata` 恢复标准头，并单独写入 `httpEtag` 与对象大小。
+禁止在通用读取路径调用 `text()` 或 `arrayBuffer()` 缓冲整个对象。返回响应前使用 `writeHttpMetadata` 恢复标准头，并单独写入 `httpEtag` 与对象大小；再使用 KV 中的 `SnipMeta` 写入 `X-Snip-Key`、`X-Snip-Source`、`X-Snip-Filename`、`X-Snip-Created-At` 和可选的 `X-Snip-Expires-At`。
 
 ### 7.3 R2 原子统计对象
 
@@ -454,12 +467,13 @@ KV 和 R2 没有跨产品事务，服务层通过 R2 条件写入、原子统计
 
 1. 解析 key，读取旧 KV 元数据。
 2. 覆盖时读取旧 `R2ObjectBody`，保留正文流、`httpMetadata`、`customMetadata` 和 `storageClass`。
-3. 新建使用 `etagDoesNotMatch: '*'`，覆盖使用旧 ETag 的 `etagMatches` 条件写入；并发输家返回冲突，不执行回滚或计数。
-4. 按 R2 返回的实际 `size` 校验上限。
-5. 写 KV 索引及 TTL。
-6. 通过单次 R2 CAS 同时应用 count 和 totalSize 差值。
+3. 写入 R2 前过滤保留 key `source` 与 `filename`；这两个字段只写入新的 KV `SnipMeta`。
+4. 新建使用 `etagDoesNotMatch: '*'`，覆盖使用旧 ETag 的 `etagMatches` 条件写入；并发输家返回冲突，不执行回滚或计数。
+5. 按 R2 返回的实际 `size` 校验上限。
+6. 写 KV 索引及 TTL。
+7. 通过单次 R2 CAS 同时应用 count 和 totalSize 差值。
 
-第 3–6 步失败时：
+第 4–7 步失败时：
 
 - 新建对象：删除已写入的 R2 对象。
 - 覆盖对象：用旧正文和全部对象 metadata 恢复原对象。
@@ -469,6 +483,23 @@ KV 和 R2 没有跨产品事务，服务层通过 R2 条件写入、原子统计
 删除先原子递减统计，再删除 KV metadata 和 R2 payload；任一删除失败时恢复已删除的
 metadata，并通过反向 CAS 恢复统计。KV 先到期形成的孤立 R2 对象由 Cron 按实际
 R2 size 汇总递减统计后批量删除；批量删除失败时同样反向恢复统计。
+
+### 7.5 历史 R2 custom metadata 清理
+
+这次重构只改变后续写入和下载读取逻辑，不会在普通请求中改写已有 R2 对象。历史对象若仍有
+`source` 或 `filename` custom metadata，可单独执行一次可恢复的 metadata 迁移：
+
+1. 先列出 `snips/*/payload`，建立 dry-run 清单；只处理同时存在 KV `SnipMeta` 的对象。
+2. 对每个对象使用 R2 S3 兼容 API 的 `CopyObject` 自复制，并使用
+   `x-amz-metadata-directive: REPLACE`，完整保留原 HTTP metadata 和非保留 custom metadata，
+   仅移除 `source` 与 `filename`。
+3. 使用源对象 ETag 做并发保护（迁移工具支持时使用 `If-Match`），对象正文不下载、不删除。
+4. 迁移后重新读取对象 metadata，确认 KV 的 `source`/`filename` 和 R2 的剩余 custom metadata
+   符合预期，再分批执行下一批。
+
+这项清理不是 Worker 请求路径的一部分，也不应通过“删除后重新上传”实现；先 dry-run、再小批量
+执行，并保留失败清单，避免覆盖并发写入产生的新 metadata。R2 intrinsic size、ETag 和正文保持为
+对象自身属性，不属于本次清理目标。
 
 ## 8. 内部分层
 
@@ -515,7 +546,7 @@ src/
   utils/
     key.ts                  nanoid 随机 key
     time.ts                 TTL 与 ISO 时间
-    r2-metadata.ts          文件名、custom metadata 白名单与下载头
+    r2-metadata.ts          文件名、KV metadata 响应头、custom metadata 白名单与下载头
 
   jobs/
     cleanup.ts              分页清理 R2 孤立对象
@@ -542,8 +573,9 @@ src/
 - 服务层不依赖 Hono Context，只接收 binding 与领域输入。
 - 仓储层不感知请求来源或 MIME，只负责 KV / R2 的通用读写。
 - `source` 是 metadata，不作为权限边界。
+- `source` 与 `filename` 的 canonical value 只来自 KV；R2 custom metadata 不得重复保存这两个保留 key。
 - 内容类型由标准 `Content-Type` 表达；新增 MIME 无需修改 Schema 枚举或服务映射。
-- 只有显式 `X-Snip-Meta-*` 才进入扩展 custom metadata，避免保存敏感或无关请求头。
+- 只有显式 `X-Snip-Meta-*` 才进入扩展 custom metadata，避免保存敏感或无关请求头；`source`/`filename` 保留 key 会被过滤。
 - 新客户端复用 `/snip`，不引入客户端专属路由。
 - 大对象读写保持流式，不在 route/service/repository 任一层转成完整字符串或缓冲区。
 
@@ -561,7 +593,7 @@ src/
 |------|------|
 | repositories | KV Schema 边界、对象路径、任意字节、完整 R2 metadata、分页和空值 |
 | schemas | header、MIME、TTL、overwrite、HTTP 日期、key 与 cursor 边界 |
-| utils | 文件名解析、UTF-8 编码、metadata 白名单与 8192 字节计算 |
+| utils | 文件名解析、canonical metadata 头映射、custom metadata 白名单与 8192 字节计算 |
 | services | 生成 key、R2 条件冲突、覆盖、TTL、实际大小、原子统计与补偿回滚 |
 | routes | 原始 HTTP body、标准/自定义 metadata、流式下载、错误与完整生命周期 |
 | jobs | 分页扫描，只删除没有 KV 索引的 `snips/` 对象 |
@@ -596,12 +628,14 @@ _schemas 与 utils_
 - 从 `X-Snip-Filename` 与三种 Content-Disposition filename 形式提取名称。
 - UTF-8 custom metadata 按字节计数。
 - Authorization、Cookie、Host、CF-* 不进入 custom metadata。
+- `X-Snip-Meta-Source` 与 `X-Snip-Meta-Filename` 不会覆盖 KV canonical fields。
 
 _services/snip/create_
 
 - 缺省 key 生成非空且不冲突的随机值，最多尝试 3 次。
 - 已存在 key 且 overwrite=false 返回 `KeyConflictError`。
-- 任意 payload 和完整 metadata 被原样传给 R2。
+- 任意 payload 和 HTTP/扩展 metadata 被写入 R2，KV canonical source/filename 单独写入。
+- 保留 key 不会进入 R2 custom metadata。
 - 以 R2 实际 size 写 KV 与 stats。
 - 并发创建同一 key 只有一个成功且只计数一次。
 - stats 更新失败时恢复 payload 与 KV metadata，包括旧 TTL。
@@ -612,7 +646,8 @@ _routes_
 
 - Content-Type 可为 `text/markdown`、`application/pdf` 或 vendor MIME。
 - 原始二进制 `POST` → `GET` 后字节完全一致。
-- 六个标准 metadata 头写入 R2并在下载时恢复。
+- 六个标准 metadata 头写入 R2 并在下载时恢复。
+- GET 下载继续返回原始字节，并额外返回 KV 映射的 `X-Snip-*` metadata 头。
 - filename 在缺少 Content-Disposition 时生成 RFC 5987 下载头。
 - custom metadata 仅接收 `X-Snip-Meta-*`。
 - 列表不返回正文、source、custom metadata 或 `r2Key`。
@@ -690,7 +725,7 @@ PUT  /health           -> 405
 
 13. 在 `domain/types.ts` 定义 `SnipExpiry`、`SnipPayload`、`CreateSnipInput`、`SnipMeta`、`CreateSnipResponse`、`ListSnipItem`、`ListSnipsResponse` 和 `Stats`。
 14. 在 `utils/key.ts` 用 nanoid 的 62 字符字母表生成 5 位 key；在 `utils/time.ts` 实现当前时间和 TTL 到 ISO 时间转换。
-15. 新建 `utils/r2-metadata.ts`：解析 X-Snip-Filename、解析 Content-Disposition、从 `X-Snip-Meta-*` 构造白名单 custom metadata、按 UTF-8 统计大小、生成 RFC 5987 Content-Disposition。
+15. 新建 `utils/r2-metadata.ts`：解析 X-Snip-Filename、解析 Content-Disposition、从 `X-Snip-Meta-*` 构造白名单 custom metadata、过滤 `source`/ `filename` 保留 key、按 UTF-8 统计大小、生成 RFC 5987 Content-Disposition，并将 KV 业务 metadata 映射为下载响应头。
 16. 在 `repositories/kv.ts` 实现 `getSnip`、`keyExists`、`putSnip`、`deleteSnip` 和 `listSnips`；所有 JSON 读取通过 `SnipMetaSchema`，不在 KV 中维护计数器。
 17. 在 `repositories/r2-payload.ts` 实现 payload CRUD、条件 put、批量 delete 和带 size 的 list；在 `repositories/r2-stats.ts` 实现单对象统计 Schema、ETag CAS 和最多 16 次冲突重试。
 
@@ -734,7 +769,7 @@ key="" -> success: true
 实现步骤：
 
 21. 在 `services/snip/create.ts` 实现 key 解析和最多 3 次碰撞重试；overwrite=false 时先返回冲突。
-22. 覆盖前读取旧 KV 与 R2；将原始 payload、httpMetadata、customMetadata 写 R2，以返回的实际 size 校验上限并构造 KV `SnipMeta`。
+22. 覆盖前读取旧 KV 与 R2；将原始 payload、httpMetadata 和过滤后的扩展 customMetadata 写 R2，以返回的实际 size 校验上限并构造包含 source/filename 的 KV `SnipMeta`。
 23. 按 7.4 节用 R2 ETag 条件创建/覆盖 payload；失败时回滚 R2 与 KV；成功后通过一次 CAS 同时应用 count/totalSize 差值。
 24. 实现 `read.ts` 返回 `{ meta, payload: R2ObjectBody }`，`list.ts` 做 KV 分页并过滤 TTL 期间消失的条目，`delete.ts` 先原子递减统计再删除 KV/R2，失败时补偿。
 25. 实现 `services/stats.ts`，从 R2 统计对象读取动态值，并对 storage limit 做非负整数校验。
@@ -760,14 +795,14 @@ TTL / forever -> KV expiration 与 expiresAt 正确
 
 26. 在 `routes/snip.ts` 的 POST handler 中读取原始 Headers，以 `CreateSnipHeadersSchema` 校验；构造六个字段的 `R2HTTPMetadata` 和白名单 `customMetadata`；校验 8192 字节后把 `c.req.raw.body` 原样传给 create service。
 27. POST 只返回显式 `CreateSnipResponse`；list 只返回显式 `ListSnipItem`，不展开 `SnipMeta`。
-28. GET `/:key` 读取 `R2ObjectBody`，用 `writeHttpMetadata`、`httpEtag`、`size` 和 filename 生成头，再直接返回 `payload.body`。
+28. GET `/:key` 读取 `R2ObjectBody`，用 `writeHttpMetadata`、`httpEtag`、`size` 和 KV filename 生成标准头，再写入 `X-Snip-*` metadata 头并直接返回 `payload.body`。
 29. 实现 DELETE、list cursor 和 stats 路由，在 `app.ts` 注册全部 router。
 
 验收：
 
 ~~~
 POST arbitrary binary -> 201 JSON metadata
-GET  /snip/:key -> 原始字节 + 正确 HTTP metadata
+GET  /snip/:key -> 原始字节 + 正确 HTTP metadata + X-Snip-* 业务 metadata
 GET  /snip -> 不含正文/source/r2Key
 DELETE /snip/:key -> 204
 GET  /stats -> count/totalSize/storageLimit
@@ -813,7 +848,7 @@ GET /__scheduled -> 执行任务
 - 旧客户端发送的 `{ key, type, content, source, expiry }` JSON 包装不再接受，必须改成“原始 body + 请求头”。
 - `GET /snip/:key` 从 JSON 改为原始对象响应，调用方必须按 Content-Type/Content-Disposition 处理。
 - 旧 KV 数据包含 `type` 而没有 `contentType`、`filename`，新 `SnipMetaSchema` 会拒绝；部署前迁移或清空旧 `snip:*` 索引。
-- R2 路径 `snips/{key}/payload` 未改变，bucket 对象本身无需搬迁，但若清空 KV 索引，Cron 会把对应 R2 对象视为孤立对象；迁移完成前应暂停清理触发器。
+- R2 路径 `snips/{key}/payload` 未改变，bucket 对象本身无需搬迁；已有对象若含 `source`/`filename` custom metadata，按 7.5 节执行 metadata-only 清理。若清空 KV 索引，Cron 会把对应 R2 对象视为孤立对象；迁移完成前应暂停清理触发器。
 - 旧 KV `meta:count`/`meta:totalSize` 不再读取；如果已有 payload，部署前按
   `snips/*/payload` 的对象数量和 size 创建 R2 `meta/stats.json`。全新或空 bucket
   无需迁移，首次创建会从零值原子初始化。
@@ -824,7 +859,7 @@ GET /__scheduled -> 执行任务
 GET  /health -> 200
 GET  /health/auth（正确 Token）-> 200
 POST /snip（任意 MIME + TTL + custom metadata）-> 201
-GET  /snip/:key -> 字节、Content-Type、文件名一致
+GET  /snip/:key -> 字节、Content-Type、文件名和 X-Snip-* metadata 一致
 GET  /snip -> contentType / filename / size 正确
 GET  /stats -> count / totalSize / storageLimit 正确
 DELETE /snip/:key -> 204，随后 GET -> 404

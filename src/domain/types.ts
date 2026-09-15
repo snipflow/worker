@@ -19,6 +19,7 @@ export type SnipPayload =
 export interface CreateSnipInput {
   key: string
   source: string
+  filename: string | null
   expiry: SnipExpiry
   overwrite: boolean
   maxSize: number

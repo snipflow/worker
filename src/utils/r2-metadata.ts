@@ -1,11 +1,14 @@
+import type { SnipMeta } from '../domain/types'
+
 const CUSTOM_METADATA_HEADER_PREFIX = 'x-snip-meta-'
+const RESERVED_CUSTOM_METADATA_KEYS = new Set(['source', 'filename'])
 export const MAX_CUSTOM_METADATA_SIZE = 8_192
 
 const utf8Encoder = new TextEncoder()
 
 /**
  * 浏览器请求头只接受 ASCII。前端可对 UTF-8 文件名使用 encodeURIComponent，
- * Worker 在写入 R2 customMetadata 前恢复原值。
+ * Worker 在写入 KV canonical metadata 前恢复原值。
  */
 export function filenameFromHeader(value: string | undefined): string | undefined {
   if (!value) return undefined
@@ -39,13 +42,19 @@ export function filenameFromContentDisposition(
 
 /**
  * 只接收显式声明为 snip metadata 的请求头，避免保存 Authorization、Cookie、
- * CF-*、Host 等认证或传输层信息。
+ * CF-*、Host 以及 KV 中已经保存的业务 metadata。
  */
-export function createCustomMetadata(
-  headers: Headers,
-  source: string,
-  filename?: string
+export function stripReservedCustomMetadata(
+  metadata: Record<string, string>
 ): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(metadata).filter(
+      ([key]) => !RESERVED_CUSTOM_METADATA_KEYS.has(key.toLowerCase())
+    )
+  )
+}
+
+export function createCustomMetadata(headers: Headers): Record<string, string> {
   const metadata: Record<string, string> = {}
 
   for (const [name, value] of headers) {
@@ -55,9 +64,30 @@ export function createCustomMetadata(
     }
   }
 
-  metadata.source = source
-  if (filename) metadata.filename = filename
-  return metadata
+  return stripReservedCustomMetadata(metadata)
+}
+
+function encodeResponseHeaderValue(value: string): string {
+  return encodeURIComponent(value)
+}
+
+/**
+ * 将 KV 中的业务 metadata 映射为可被浏览器读取的响应头。
+ * 文件名和来源使用 URI 编码，以保证响应头始终是 ASCII。
+ */
+export function writeSnipMetadataHeaders(
+  headers: Headers,
+  meta: Pick<SnipMeta, 'key' | 'source' | 'filename' | 'createdAt' | 'expiresAt'>
+): void {
+  headers.set('X-Snip-Key', meta.key)
+  headers.set('X-Snip-Source', encodeResponseHeaderValue(meta.source))
+  if (meta.filename) {
+    headers.set('X-Snip-Filename', encodeResponseHeaderValue(meta.filename))
+  }
+  headers.set('X-Snip-Created-At', meta.createdAt)
+  if (meta.expiresAt) {
+    headers.set('X-Snip-Expires-At', meta.expiresAt)
+  }
 }
 
 export function customMetadataSize(metadata: Record<string, string>): number {

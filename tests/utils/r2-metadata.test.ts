@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   contentDispositionForFilename,
   createCustomMetadata,
+  writeSnipMetadataHeaders,
   customMetadataSize,
   filenameFromContentDisposition,
   filenameFromHeader,
@@ -32,11 +33,27 @@ describe('R2 metadata utilities', () => {
       'X-Snip-Meta-Filename': 'cannot-override.txt',
     })
 
-    expect(createCustomMetadata(headers, 'page', 'report.pdf')).toEqual({
+    expect(createCustomMetadata(headers)).toEqual({
       category: 'report',
-      source: 'page',
-      filename: 'report.pdf',
     })
+  })
+
+  it('writes browser-readable response headers from canonical metadata', () => {
+    const headers = new Headers()
+
+    writeSnipMetadataHeaders(headers, {
+      key: 'report-2026',
+      source: '来源页',
+      filename: '报告.pdf',
+      createdAt: '2026-09-15T08:00:00.000Z',
+      expiresAt: '2026-09-16T08:00:00.000Z',
+    })
+
+    expect(headers.get('x-snip-key')).toBe('report-2026')
+    expect(headers.get('x-snip-source')).toBe('%E6%9D%A5%E6%BA%90%E9%A1%B5')
+    expect(headers.get('x-snip-filename')).toBe('%E6%8A%A5%E5%91%8A.pdf')
+    expect(headers.get('x-snip-created-at')).toBe('2026-09-15T08:00:00.000Z')
+    expect(headers.get('x-snip-expires-at')).toBe('2026-09-16T08:00:00.000Z')
   })
 
   it('counts UTF-8 bytes for the R2 metadata limit', () => {

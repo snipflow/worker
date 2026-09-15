@@ -2,7 +2,7 @@
 
 Snipflow Worker 是部署在 Cloudflare Workers 上的轻量对象存储 API。它可以保存文本、JSON、图片、文档和任意二进制内容，不要求 JSON 包装，也不限制为固定的文件类别。
 
-你只需要一个 Cloudflare 账号、一个 KV namespace、一个 R2 bucket 和一个访问 Token。Token 存放在 Cloudflare Secrets Store 中，不写入 Worker 配置。本文面向部署者和 API 使用者；如需了解内部实现或从零复刻项目，请阅读 [architecture.md](./architecture.md)。
+你只需要一个 Cloudflare 账号、一个 KV namespace、一个 R2 bucket 和一个访问 Token。Token 存放在 Cloudflare Secrets Store 中，不写入 Worker 配置。本文介绍部署、配置和 API 使用方式；存储模型与模块职责见 [architecture.md](./architecture.md)。
 
 ## 快速部署
 
@@ -25,7 +25,7 @@ pnpm exec wrangler kv namespace create snipflow-kv
 pnpm exec wrangler r2 bucket create snipflow-r2
 ~~~
 
-先准备一个 Secrets Store。账号目前只能有一个 Store；如果已经存在，直接使用 `store list` 输出的 ID：
+先准备一个 Secrets Store。如果账号已经存在 Store，直接使用 `store list` 输出的 ID；否则创建一个：
 
 ~~~bash
 pnpm exec wrangler secrets-store store list --remote
@@ -34,7 +34,7 @@ pnpm exec wrangler secrets-store secret create <STORE_ID> \
   --name SNIPFLOW_API_TOKEN --scopes workers --remote
 ~~~
 
-最后一条命令会交互式提示输入 Token。当前 Cloudflare API Token 需要 `Account Secrets Store Edit` 权限，且部署绑定 Secrets Store 也需要该权限。
+最后一条命令会交互式提示输入 Token。创建 Secret 和部署 Secrets Store 绑定需要 `Account Secrets Store Edit` 权限。
 
 把命令输出的 KV namespace ID 和 R2 bucket 名称填入 `wrangler.jsonc`：
 
@@ -46,7 +46,7 @@ pnpm exec wrangler secrets-store secret create <STORE_ID> \
 - `SNIPFLOW_TOTAL_STORAGE_LIMIT`：`GET /stats` 返回的容量展示值，默认 100 MiB
 - `SNIPFLOW_DISGUISE`：`true` 时把错误伪装成 `200 Hello World`，默认 `false`
 
-建议使用足够长的随机 Token。`SNIPFLOW_TOTAL_STORAGE_LIMIT` 当前只用于统计响应，不会自动阻止总容量继续增长。
+建议使用足够长的随机 Token。`SNIPFLOW_TOTAL_STORAGE_LIMIT` 用于统计响应，不会自动阻止总容量继续增长。
 
 本地开发不能读取 `--remote` 创建的生产 Secret。如需本地运行测试或 `pnpm dev`，使用相同的 Store ID 创建本地 Secret（不要加 `--remote`），值可以使用单独的开发 Token：
 
@@ -74,7 +74,7 @@ export SNIPFLOW_TOKEN="你的-token"
 
 ### 跨域浏览器调用
 
-Worker 使用 Hono CORS 中间件处理浏览器的 `OPTIONS` 预检请求和实际响应。若前端与 Worker 不同源，请在 `wrangler.jsonc` 中把 `SNIPFLOW_CORS_ORIGINS` 设置为前端的精确 Origin，例如：
+Worker 会处理浏览器的 `OPTIONS` 预检请求和实际响应。若前端与 Worker 不同源，请在 `wrangler.jsonc` 中把 `SNIPFLOW_CORS_ORIGINS` 设置为前端的精确 Origin，例如：
 
 ~~~jsonc
 {
@@ -84,7 +84,7 @@ Worker 使用 Hono CORS 中间件处理浏览器的 `OPTIONS` 预检请求和实
 }
 ~~~
 
-不要把私有 Bearer Token API 配置为 `*`。如果 Page 和 Worker 通过同一域名提供服务，则优先使用同源路由，此时可以不配置跨域来源。跨域预检会在方法守卫之前处理，允许 `GET`、`POST`、`DELETE` 以及 `Authorization`、`Content-Type`、`X-Snip-*` 等项目请求头。
+不要把私有 Bearer Token API 配置为 `*`。如果 Page 和 Worker 通过同一域名提供服务，则优先使用同源路由，此时可以不配置跨域来源。跨域请求允许 `GET`、`POST`、`DELETE`，以及 `Authorization`、`Content-Type`、`X-Snip-*` 等项目请求头。
 
 ### 本地启动
 
@@ -92,7 +92,7 @@ Worker 使用 Hono CORS 中间件处理浏览器的 `OPTIONS` 预检请求和实
 pnpm dev
 ~~~
 
-请以 Wrangler 启动日志中的地址为准。当前开发配置使用 `http://localhost:10001`；若复制的模板未设置 `dev.port`，Wrangler 会使用其默认端口。本地测试时可按实际地址设置：
+请以 Wrangler 启动日志中的地址为准。模板默认使用 `http://localhost:10001`；如果端口发生变化，本地测试时按实际地址设置：
 
 ~~~bash
 export SNIPFLOW_URL="http://localhost:10001"
@@ -129,7 +129,7 @@ curl \
 
 ### 上传文件
 
-`POST /snip` 的请求正文就是文件本身。必须提供 Bearer Token、真实 `Content-Type` 和 `X-Snip-Source`：
+`POST /snip` 的请求正文就是文件本身。必须提供 Bearer Token、`Content-Type` 和 `X-Snip-Source`：
 
 ~~~bash
 curl -X POST "$SNIPFLOW_URL/snip" \
@@ -159,7 +159,7 @@ curl -X POST "$SNIPFLOW_URL/snip" \
 
 ### 上传文本或 JSON
 
-文本仍然使用相同接口，不需要 `type: "text"`：
+文本使用相同接口，正文直接发送文本内容：
 
 ~~~bash
 curl -X POST "$SNIPFLOW_URL/snip" \
@@ -192,6 +192,18 @@ curl -fL \
 ~~~
 
 Worker 会恢复上传时保存的 Content-Type、Content-Language、Content-Disposition、Content-Encoding、Cache-Control 和 Expires，并返回 ETag 与 Content-Length。
+
+下载响应还会通过以下头返回 KV 中的业务 metadata：
+
+| 响应 Header | 内容 |
+|---|---|
+| `X-Snip-Key` | snip key |
+| `X-Snip-Source` | source，URI 编码 |
+| `X-Snip-Filename` | filename，URI 编码；没有文件名时省略 |
+| `X-Snip-Created-At` | 创建时间，ISO 8601 |
+| `X-Snip-Expires-At` | TTL 到期时间，ISO 8601；永久对象时省略 |
+
+`X-Snip-Source` 和 `X-Snip-Filename` 使用 `encodeURIComponent` 编码，前端读取后应使用 `decodeURIComponent` 还原。CORS 响应会暴露这些 `X-Snip-*` 头。
 
 如果上传时提供了文件名但没有 Content-Disposition，Worker 会在响应中自动生成 RFC 5987 下载文件名。文本内容可省略 `--output` 直接查看。
 
@@ -245,9 +257,7 @@ curl \
 }
 ~~~
 
-`count` 与 `totalSize` 存在同一个 R2 统计对象中，并通过 ETag 条件写入共同更新。
-这能避免 Workers KV 最终一致性造成的负数或丢失增量；高频并发写入场景仍建议改用
-Durable Object 或 D1。
+`count` 是对象数量，`totalSize` 是对象总字节数，`storageLimit` 是配置的容量展示值。
 
 ### 删除对象
 
@@ -313,7 +323,7 @@ headers.set('X-Snip-Filename', encodeURIComponent(file.name))
 
 ### R2 custom metadata
 
-`X-Snip-Source` 保存为 `source`，文件名保存为 `filename`。任何 `X-Snip-Meta-*` 请求头都会去掉前缀并保存为扩展 metadata：
+`source` 和 `filename` 是对象的业务 metadata，不属于 R2 custom metadata。`X-Snip-Meta-*` 用于添加扩展 metadata，去掉前缀后作为 R2 custom metadata 的 key：
 
 ~~~http
 X-Snip-Meta-Category: finance
@@ -325,13 +335,13 @@ X-Snip-Meta-Owner: team-a
 ~~~json
 {
   "category": "finance",
-  "owner": "team-a",
-  "source": "page",
-  "filename": "report.pdf"
+  "owner": "team-a"
 }
 ~~~
 
-custom metadata 的 key/value UTF-8 字节数合计最多 8192。Authorization、Cookie、Host、CF-*、Content-Length 和其他未显式允许的头不会保存。除 filename 用于生成下载头外，扩展 custom metadata 当前不会在公开 API 响应中返回。
+custom metadata 的 key/value UTF-8 字节数合计最多 8192。Authorization、Cookie、Host、CF-*、Content-Length 和其他未显式允许的头不会保存。`source` 与 `filename` 是保留 key，通过 `X-Snip-Meta-Source` 或 `X-Snip-Meta-Filename` 传入时会被忽略。扩展 custom metadata 不会通过下载接口返回。
+
+读取对象时，API 以 KV 中的 `source` 和 `filename` 为准；已有 R2 对象中的同名旧字段不会影响接口响应。
 
 ## API 一览
 
@@ -341,7 +351,7 @@ custom metadata 的 key/value UTF-8 字节数合计最多 8192。Authorization�
 | GET | `/health/auth` | 是 | 认证状态 JSON |
 | POST | `/snip` | 是 | 201，创建后的索引 JSON |
 | GET | `/snip` | 是 | 分页索引 JSON |
-| GET | `/snip/:key` | 是 | 原始对象正文和 HTTP metadata |
+| GET | `/snip/:key` | 是 | 原始对象正文、HTTP metadata 和 `X-Snip-*` 业务 metadata 头 |
 | DELETE | `/snip/:key` | 是 | 204 |
 | GET | `/stats` | 是 | 存储统计 JSON |
 
@@ -375,21 +385,16 @@ custom metadata 的 key/value UTF-8 字节数合计最多 8192。Authorization�
 
 `SNIPFLOW_DISGUISE=true` 时，上述错误统一对外显示为 `200 Hello World`；排错时应查看 Worker 日志或临时关闭伪装模式。
 
-## 从旧版升级
+## 迁移现有部署
 
-本次 API 是破坏性升级：
+如果已有旧版 Worker 或 bucket，请在部署前完成以下检查：
 
-- 不再接受 `{ key, type, content, source, expiry }` 的 JSON 包装。
-- 不再使用 `text`、`image`、`file` 三种类型。
-- `GET /snip/:key` 不再返回包含 `content` 的 JSON，而是直接返回对象。
-- 旧 KV 索引只有 `type`，缺少 `contentType` 和 `filename`，部署前必须迁移或清空旧 `snip:*` 数据。
-- 旧 KV `meta:count` 和 `meta:totalSize` 不再读取。
-
-如果升级时 bucket 中已有 `snips/*/payload`，部署前需要按现存对象数量和 size 创建
-R2 `meta/stats.json`；全新或空 bucket 无需处理，首次上传会从零值自动创建。
-统计对象格式及安全迁移步骤见 [architecture.md 的 R2 原子统计章节](./architecture.md#73-r2-原子统计对象)。
-
-R2 对象路径仍为 `snips/{key}/payload`。注意：如果直接清空 KV，而每小时 Cron 仍启用，现有 R2 对象会被判定为孤立对象并删除。迁移期间请暂停清理触发器，或先重建新的 KV 索引。
+- 请求格式应使用“原始正文 + 请求头”，不再发送 `{ key, type, content, source, expiry }` JSON 包装。
+- `GET /snip/:key` 返回原始对象正文；客户端应根据响应头处理内容类型和文件名。
+- 旧 KV 索引如果只有 `type` 而缺少 `contentType` 或 `filename`，需要迁移或清理对应的 `snip:*` 数据。
+- 旧 KV `meta:count` 和 `meta:totalSize` 不会被读取；已有对象需要按数量和 size 创建 R2 `meta/stats.json`。
+- R2 custom metadata 中的旧 `source`/`filename` 不影响接口读取；如需清理，请按 [架构文档的历史 R2 custom metadata 清理章节](./architecture.md#75-历史-r2-custom-metadata-清理) 执行仅更新 metadata 的迁移。
+- 不要在 Cron 运行期间直接清空 KV；否则现有 R2 对象会被识别为孤立对象并删除。
 
 ## 常用开发命令
 
@@ -403,4 +408,4 @@ pnpm test:coverage
 pnpm deploy
 ~~~
 
-需要理解存储模型、失败补偿、模块职责、测试策略或从空目录复刻当前项目时，请继续阅读 [architecture.md](./architecture.md)。
+需要进一步了解存储模型、失败补偿、模块职责或测试策略，请阅读 [architecture.md](./architecture.md)。

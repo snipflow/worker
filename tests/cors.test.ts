@@ -39,6 +39,12 @@ describe('CORS middleware', () => {
     expect(res.headers.get('access-control-expose-headers')).toContain(
       'X-Request-Id',
     )
+    expect(res.headers.get('access-control-expose-headers')).toContain(
+      'X-Snip-Created-At',
+    )
+    expect(res.headers.get('access-control-expose-headers')).toContain(
+      'X-Snip-Filename',
+    )
     expect(res.headers.get('x-request-id')).toBeTruthy()
   })
 

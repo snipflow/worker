@@ -14,6 +14,7 @@ import {
 } from '../../repositories/r2-payload'
 import { updateStorageStats } from '../../repositories/r2-stats'
 import { generateKey } from '../../utils/key'
+import { stripReservedCustomMetadata } from '../../utils/r2-metadata'
 import { nowISO, ttlToExpiresAt } from '../../utils/time'
 
 const MAX_GENERATED_KEY_ATTEMPTS = 3
@@ -118,7 +119,7 @@ export async function createSnip(
           ? { etagMatches: previousPayload.etag }
           : { etagDoesNotMatch: '*' },
         httpMetadata: input.httpMetadata,
-        customMetadata: input.customMetadata,
+        customMetadata: stripReservedCustomMetadata(input.customMetadata),
       }
     )
     if (!stored) throw new KeyConflictError()
@@ -132,7 +133,7 @@ export async function createSnip(
         stored.httpMetadata?.contentType
         ?? input.httpMetadata.contentType
         ?? 'application/octet-stream',
-      filename: stored.customMetadata?.filename ?? input.customMetadata.filename ?? null,
+      filename: input.filename,
       source: input.source,
       size: stored.size,
       createdAt: nowISO(),

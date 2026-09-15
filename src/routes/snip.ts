@@ -23,6 +23,7 @@ import {
   customMetadataSize,
   filenameFromContentDisposition,
   filenameFromHeader,
+  writeSnipMetadataHeaders,
 } from '../utils/r2-metadata'
 
 const snipRoutes = new Hono<{ Bindings: CloudflareBindings }>()
@@ -90,11 +91,7 @@ snipRoutes.post('/', async c => {
     ...(parsed.data.cacheControl ? { cacheControl: parsed.data.cacheControl } : {}),
     ...(parsed.data.cacheExpiry ? { cacheExpiry: parsed.data.cacheExpiry } : {}),
   }
-  const customMetadata = createCustomMetadata(
-    headers,
-    parsed.data.source,
-    parsed.data.filename
-  )
+  const customMetadata = createCustomMetadata(headers)
   if (customMetadataSize(customMetadata) > MAX_CUSTOM_METADATA_SIZE) {
     throw invalidInput([{
       code: 'too_big',
@@ -107,6 +104,7 @@ snipRoutes.post('/', async c => {
   const meta = await createSnip(c.env, {
     key: parsed.data.key,
     source: parsed.data.source,
+    filename: parsed.data.filename ?? null,
     expiry: parsed.data.ttl
       ? { mode: 'ttl', ttl: parsed.data.ttl }
       : { mode: 'forever' },
@@ -149,9 +147,9 @@ snipRoutes.get('/:key', async c => {
     headers.set('Content-Type', result.meta.contentType)
   }
 
-  const filename =
-    result.payload.customMetadata?.filename
-    ?? result.meta.filename
+  writeSnipMetadataHeaders(headers, result.meta)
+
+  const filename = result.meta.filename
   if (filename && !headers.has('Content-Disposition')) {
     headers.set('Content-Disposition', contentDispositionForFilename(filename))
   }

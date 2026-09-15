@@ -21,6 +21,11 @@ const EXPOSED_HEADERS = [
   'Content-Disposition',
   'ETag',
   'X-Request-Id',
+  'X-Snip-Key',
+  'X-Snip-Source',
+  'X-Snip-Filename',
+  'X-Snip-Created-At',
+  'X-Snip-Expires-At',
 ]
 
 function parseOrigins(value: string): string[] {

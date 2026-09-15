@@ -97,8 +97,6 @@ describe('snip routes', () => {
     })
     expect(stored?.customMetadata).toEqual({
       category: 'document',
-      filename: '说明.md',
-      source: 'page',
     })
     expect(stored?.customMetadata).not.toHaveProperty('authorization')
   })
@@ -208,6 +206,31 @@ describe('snip routes', () => {
     expect(response.headers.get('content-disposition'))
       .toBe("attachment; filename*=UTF-8''%E8%AF%B4%E6%98%8E.md")
     expect(response.headers.get('etag')).toBeTruthy()
+    expect(response.headers.get('x-snip-key')).toBe('route-test')
+    expect(response.headers.get('x-snip-source')).toBe('page')
+    expect(response.headers.get('x-snip-filename')).toBe('%E8%AF%B4%E6%98%8E.md')
+    expect(response.headers.get('x-snip-created-at')).toMatch(
+      /^\d{4}-\d{2}-\d{2}T/,
+    )
+    expect(response.headers.get('x-snip-expires-at')).toBeNull()
+  })
+
+  it('uses KV metadata instead of legacy R2 custom metadata', async () => {
+    await create()
+    await env.SNIPFLOW_R2.put('snips/route-test/payload', 'legacy body', {
+      httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+      customMetadata: { source: 'legacy', filename: 'legacy.txt' },
+    })
+
+    const response = await exports.default.fetch(
+      'http://localhost/snip/route-test',
+      { headers: authHeaders }
+    )
+
+    expect(response.headers.get('x-snip-source')).toBe('page')
+    expect(response.headers.get('x-snip-filename')).toBe('%E8%AF%B4%E6%98%8E.md')
+    expect(response.headers.get('content-disposition'))
+      .toBe("attachment; filename*=UTF-8''%E8%AF%B4%E6%98%8E.md")
   })
 
   it('falls back to indexed Content-Type when R2 HTTP metadata is absent', async () => {
